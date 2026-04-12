@@ -27,6 +27,153 @@ Vulgata must support two equally valid execution modes:
 The canonical source language is the same in both cases. Semantics must match.
 
 
+## Installation
+
+**Prerequisites:** Rust toolchain (stable, 1.85+). Install via [rustup](https://rustup.rs).
+
+```sh
+git clone https://github.com/your-org/vulgata.git
+cd vulgata
+cargo build --release
+```
+
+The binary will be at `target/release/vulgata`. You can also install it into your Cargo bin path:
+
+```sh
+cargo install --path .
+```
+
+---
+
+## Usage
+
+```text
+vulgata <command> <source-file>
+```
+
+| Command | Description |
+| ------- | ----------- |
+| `parse` | Parse a source file and print the AST |
+| `check` | Type-check and lower to typed IR |
+| `run` | Interpret and execute the module |
+| `test` | Run all `test` blocks in the module |
+| `compile` | Emit Rust source code to `<file>.rs` |
+
+### Examples
+
+```sh
+vulgata run    hello.vg       # interpret and print the return value
+vulgata test   math.vg        # run inline tests, report PASS/FAIL
+vulgata check  sales.vg       # type-check only, no execution
+vulgata compile invoice.vg    # emit invoice.rs, then: rustc invoice.rs
+vulgata parse  foo.vg         # dump AST for debugging
+```
+
+---
+
+## Running the test suite
+
+```sh
+cargo test
+```
+
+This runs the conformance suite under [tests/conformance/](tests/conformance/). Each fixture pairs a `.vg` source file with a `fixture.conf` that declares the expected outcome (pass, type error, runtime failure, etc.).
+
+---
+
+## Quick tutorial
+
+The full language is specified in [spec/vulgata_spec_v0.3.md](spec/vulgata_spec_v0.3.md). What follows is a short taste.
+
+### Hello, Vulgata
+
+Save this as `hello.vg`:
+
+```text
+action greet(name: Text) -> Text:
+  return "Hello, " + name + "!"
+
+action main() -> Text:
+  return greet("world")
+```
+
+Run it:
+
+```sh
+vulgata run hello.vg
+# "Hello, world!"
+```
+
+### Types and mutability
+
+Bindings are immutable by default (`let`). Use `var` when you need mutation, and `:=` to reassign:
+
+```text
+action countdown(n: Int) -> Int:
+  var i = n
+  var total = 0
+  while i > 0:
+    total := total + i
+    i := i - 1
+  return total
+```
+
+### Records and enums
+
+```text
+record Point:
+  x: Dec
+  y: Dec
+
+enum Direction:
+  North
+  South
+  East
+  West
+
+action origin() -> Point:
+  return Point(x: 0.0, y: 0.0)
+```
+
+### Tests
+
+Inline tests live at the top level of any module:
+
+```text
+action gcd(a: Int, b: Int) -> Int:
+  var x = a
+  var y = b
+  while y != 0:
+    let r = x % y
+    x := y
+    y := r
+  return x
+
+test gcd_basic:
+  expect gcd(84, 30) == 6
+
+test gcd_coprime:
+  expect gcd(13, 7) == 1
+```
+
+```sh
+vulgata test math.vg
+# PASS gcd_basic
+# PASS gcd_coprime
+```
+
+### Compiling to Rust
+
+```sh
+vulgata compile math.vg   # writes math.rs
+rustc math.rs -o math
+./math
+```
+
+The emitted Rust is plain, readable code — no VM, no runtime dependency.
+
+---
+
 ## Principles of Participation
 
 Everyone is invited and welcome to contribute: open issues, propose pull requests, share ideas, or help improve documentation. Participation is open to all, regardless of background or viewpoint.  
