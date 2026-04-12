@@ -182,10 +182,7 @@ pub fn lower_module(module: &TypedIrModule) -> Result<RustModule, Vec<Diagnostic
     items.push(entrypoint_item(module)?);
 
     Ok(RustModule {
-        uses: vec![
-            "use std::cell::RefCell;".to_string(),
-            "use std::rc::Rc;".to_string(),
-        ],
+        uses: Vec::new(),
         items,
     })
 }
@@ -212,10 +209,9 @@ fn lower_action_body(
         body.push(lower_stmt(stmt, false)?);
     }
 
-    let result_ty = action.ty.action_result();
-    if *result_ty == Type::None {
+    if block_may_fall_through(&body) && *action.ty.action_result() == Type::None {
         body.push(RustStmt::Raw("()".to_string()));
-    } else {
+    } else if block_may_fall_through(&body) {
         body.push(RustStmt::Raw(format!(
             "panic!(\"action `{}` fell through without returning\");",
             action.name
@@ -444,7 +440,7 @@ fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
             }
         }
         TypedExprKind::List(items) => Ok(RustExpr::raw(format!(
-            "Rc::new(RefCell::new(vec![{}]))",
+            "std::rc::Rc::new(std::cell::RefCell::new(vec![{}]))",
             items
                 .iter()
                 .map(lower_expr)
@@ -455,7 +451,7 @@ fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
                 .join(", ")
         ))),
         TypedExprKind::Map(entries) => Ok(RustExpr::raw(format!(
-            "Rc::new(RefCell::new(vec![{}]))",
+            "std::rc::Rc::new(std::cell::RefCell::new(vec![{}]))",
             entries
                 .iter()
                 .map(|(key, value)| {
@@ -533,7 +529,7 @@ fn lower_call(
                     ));
                 }
                 return Ok(RustExpr::raw(format!(
-                    "Rc::new(RefCell::new({} {{ {} }}))",
+                    "std::rc::Rc::new(std::cell::RefCell::new({} {{ {} }}))",
                     symbol.name,
                     fields.join(", ")
                 )));
@@ -618,16 +614,16 @@ fn lower_storage_type(ty: &Type, span: &SourceSpan) -> Result<RustType, Vec<Diag
         Type::Text => "String".to_string(),
         Type::Bytes => "Vec<u8>".to_string(),
         Type::None => return Ok(RustType::Unit),
-        Type::Record(name) => format!("Rc<RefCell<{name}>>"),
+        Type::Record(name) => format!("std::rc::Rc<std::cell::RefCell<{name}>>"),
         Type::Enum(name) => name.clone(),
         Type::List(inner) | Type::Set(inner) => {
             format!(
-                "Rc<RefCell<Vec<{}>>>",
+                "std::rc::Rc<std::cell::RefCell<Vec<{}>>>",
                 render_type(&lower_storage_type(inner, span)?)
             )
         }
         Type::Map(key, value) => format!(
-            "Rc<RefCell<Vec<({}, {})>>>",
+            "std::rc::Rc<std::cell::RefCell<Vec<({}, {})>>>",
             render_type(&lower_storage_type(key, span)?),
             render_type(&lower_storage_type(value, span)?)
         ),
@@ -876,6 +872,10 @@ fn render_stmt(stmt: &RustStmt, indent: usize, output: &mut String) {
 }
 
 fn render_expr(expr: &RustExpr) -> String {
+    render_expr_prec(expr, 0, false)
+}
+
+fn render_expr_prec(expr: &RustExpr, parent_prec: u8, is_right_child: bool) -> String {
     match expr {
         RustExpr::Raw(raw) => raw.clone(),
         RustExpr::Call { callee, args } => format!(
@@ -894,9 +894,28 @@ fn render_expr(expr: &RustExpr) -> String {
         ),
         RustExpr::Field { base, field } => format!("{}.{}", render_expr(base), field),
         RustExpr::Binary { left, op, right } => {
-            format!("({} {} {})", render_expr(left), op, render_expr(right))
+            let prec = binary_precedence(op);
+            let rendered = format!(
+                "{} {} {}",
+                render_expr_prec(left, prec, false),
+                op,
+                render_expr_prec(right, prec, true)
+            );
+            if prec < parent_prec || (is_right_child && prec == parent_prec) {
+                format!("({rendered})")
+            } else {
+                rendered
+            }
         }
-        RustExpr::Unary { op, expr } => format!("({}{})", op, render_expr(expr)),
+        RustExpr::Unary { op, expr } => {
+            let prec = 60;
+            let rendered = format!("{op}{}", render_expr_prec(expr, prec, false));
+            if prec < parent_prec {
+                format!("({rendered})")
+            } else {
+                rendered
+            }
+        }
     }
 }
 
@@ -922,6 +941,17 @@ fn binary_op(op: &BinaryOp) -> &'static str {
         BinaryOp::GreaterEqual => ">=",
         BinaryOp::And => "&&",
         BinaryOp::Or => "||",
+    }
+}
+
+fn binary_precedence(op: &str) -> u8 {
+    match op {
+        "||" => 10,
+        "&&" => 20,
+        "==" | "!=" | "<" | "<=" | ">" | ">=" => 30,
+        "+" | "-" => 40,
+        "*" | "/" | "%" => 50,
+        _ => 0,
     }
 }
 
@@ -959,6 +989,8 @@ fn line(indent: usize, text: &str, output: &mut String) {
 }
 
 const SUPPORT_MODULE: &str = r#"mod support {
+    #![allow(dead_code)]
+
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1001,6 +1033,37 @@ const SUPPORT_MODULE: &str = r#"mod support {
         }
     }
 }"#;
+
+fn block_may_fall_through(block: &[RustStmt]) -> bool {
+    let mut may_continue = true;
+    for stmt in block {
+        if !may_continue {
+            return false;
+        }
+        may_continue = stmt_may_fall_through(stmt);
+    }
+    may_continue
+}
+
+fn stmt_may_fall_through(stmt: &RustStmt) -> bool {
+    match stmt {
+        RustStmt::Return(_) | RustStmt::Break | RustStmt::Continue => false,
+        RustStmt::If {
+            then_body,
+            else_body,
+            ..
+        } if !else_body.is_empty() => {
+            block_may_fall_through(then_body) || block_may_fall_through(else_body)
+        }
+        RustStmt::Let { .. }
+        | RustStmt::Assign { .. }
+        | RustStmt::While { .. }
+        | RustStmt::ForEach { .. }
+        | RustStmt::Expr(_)
+        | RustStmt::Raw(_)
+        | RustStmt::If { .. } => true,
+    }
+}
 
 trait ActionTypeExt {
     fn action_result(&self) -> &Type;
