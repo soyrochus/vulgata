@@ -1,0 +1,3 @@
+action main() -> Int:
+  let count: Int = "oops"
+  return count

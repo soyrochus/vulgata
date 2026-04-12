@@ -1,0 +1,7 @@
+action main() -> Int:
+  let x = 4
+  let y = 2
+  while y > 0:
+    set x = x + 1
+    set y = y - 1
+  return x

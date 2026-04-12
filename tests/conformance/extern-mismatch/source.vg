@@ -1,0 +1,4 @@
+extern action add(a: Int, b: Int) -> Int
+
+action main() -> Int:
+  return add(2, 5)

@@ -1,0 +1,5 @@
+[extern.add]
+provider = "rust"
+symbol = "builtin::echo_text"
+params = ["Text"]
+return = "Text"

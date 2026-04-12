@@ -1,0 +1,7 @@
+record Customer:
+  email: Text
+
+action main() -> Text:
+  let customer = Customer(email: "before")
+  set customer.email = "after"
+  return customer.email
