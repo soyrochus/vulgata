@@ -59,6 +59,26 @@ pub struct CheckedModule {
     pub constants: HashMap<String, Type>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedExpr {
+    pub ty: Type,
+    pub expr_types: HashMap<u32, Type>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplBinding {
+    pub ty: Type,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedStmt {
+    pub expr_types: HashMap<u32, Type>,
+    pub target_types: HashMap<SourceSpan, Type>,
+    pub target_root_mutability: HashMap<SourceSpan, bool>,
+    pub binding: Option<(String, ReplBinding)>,
+}
+
 pub struct TypeChecker<'a> {
     module: &'a AstModule,
     resolution: &'a Resolution,
@@ -766,7 +786,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Target::Field { base, field, span } => {
-                let (base_type, base_mutable) = self.type_target_with_root_mutability(base, scope, in_test)?;
+                let (base_type, base_mutable) =
+                    self.type_target_with_root_mutability(base, scope, in_test)?;
                 match base_type {
                     Type::Record(record_name) => {
                         let record = self.records.get(&record_name).ok_or_else(|| {
@@ -775,13 +796,17 @@ impl<'a> TypeChecker<'a> {
                                 format!("unknown record type `{record_name}`"),
                             )]
                         })?;
-                        record.fields.get(field).cloned().ok_or_else(|| {
-                            vec![type_error(
-                                span,
-                                format!("record `{record_name}` has no field `{field}`"),
-                            )]
-                        })
-                        .map(|ty| (ty, base_mutable))
+                        record
+                            .fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| {
+                                vec![type_error(
+                                    span,
+                                    format!("record `{record_name}` has no field `{field}`"),
+                                )]
+                            })
+                            .map(|ty| (ty, base_mutable))
                     }
                     other => Err(vec![type_error(
                         span,
@@ -793,7 +818,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Target::Index { base, index, span } => {
-                let (base_type, base_mutable) = self.type_target_with_root_mutability(base, scope, in_test)?;
+                let (base_type, base_mutable) =
+                    self.type_target_with_root_mutability(base, scope, in_test)?;
                 let index_type = self.type_expr(index, scope, in_test)?;
                 match base_type {
                     Type::List(item) => {
@@ -954,6 +980,115 @@ impl<'a> TypeChecker<'a> {
             }
         }
     }
+}
+
+pub fn check_expression(
+    checked: &CheckedModule,
+    expr: &Expr,
+) -> Result<CheckedExpr, Vec<Diagnostic>> {
+    check_expression_with_bindings(checked, expr, &HashMap::new())
+}
+
+pub fn check_expression_with_bindings(
+    checked: &CheckedModule,
+    expr: &Expr,
+    bindings: &HashMap<String, ReplBinding>,
+) -> Result<CheckedExpr, Vec<Diagnostic>> {
+    let mut checker = TypeChecker::new(&checked.module, &checked.resolution);
+    checker.register_top_level_types()?;
+    checker.constants = checked.constants.clone();
+    let mut scope = Scope::default();
+    for (name, binding) in bindings {
+        scope.insert(name.clone(), binding.ty.clone(), binding.mutable);
+    }
+    let ty = checker.type_expr(expr, &mut scope, false)?;
+    Ok(CheckedExpr {
+        ty,
+        expr_types: checker.expr_types,
+    })
+}
+
+pub fn check_statement(
+    checked: &CheckedModule,
+    stmt: &Stmt,
+    bindings: &HashMap<String, ReplBinding>,
+) -> Result<CheckedStmt, Vec<Diagnostic>> {
+    match &stmt.kind {
+        StmtKind::Let { .. }
+        | StmtKind::Var { .. }
+        | StmtKind::Assign { .. }
+        | StmtKind::Expr(_) => {}
+        _ => {
+            return Err(vec![Diagnostic::new(
+                stmt.span.clone(),
+                Phase::Cli,
+                "repl currently supports `let`, `var`, `:=`, and expression input",
+            )]);
+        }
+    }
+
+    let mut checker = TypeChecker::new(&checked.module, &checked.resolution);
+    checker.register_top_level_types()?;
+    checker.constants = checked.constants.clone();
+    let mut scope = Scope::default();
+    for (name, binding) in bindings {
+        scope.insert(name.clone(), binding.ty.clone(), binding.mutable);
+    }
+    checker.type_stmt(stmt, &mut scope, false, &Type::None, 0)?;
+
+    let binding = match &stmt.kind {
+        StmtKind::Let {
+            name,
+            explicit_type,
+            value,
+        } => Some((
+            name.clone(),
+            ReplBinding {
+                ty: if let Some(explicit_type) = explicit_type {
+                    checker.lower_type_ref(explicit_type, &stmt.span)?
+                } else {
+                    checker.expr_types.get(&value.id).cloned().ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            value.span.clone(),
+                            Phase::TypeCheck,
+                            "missing inferred type for repl binding",
+                        )]
+                    })?
+                },
+                mutable: false,
+            },
+        )),
+        StmtKind::Var {
+            name,
+            explicit_type,
+            value,
+        } => Some((
+            name.clone(),
+            ReplBinding {
+                ty: if let Some(explicit_type) = explicit_type {
+                    checker.lower_type_ref(explicit_type, &stmt.span)?
+                } else {
+                    checker.expr_types.get(&value.id).cloned().ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            value.span.clone(),
+                            Phase::TypeCheck,
+                            "missing inferred type for repl binding",
+                        )]
+                    })?
+                },
+                mutable: true,
+            },
+        )),
+        StmtKind::Assign { .. } | StmtKind::Expr(_) => None,
+        _ => None,
+    };
+
+    Ok(CheckedStmt {
+        expr_types: checker.expr_types,
+        target_types: checker.target_types,
+        target_root_mutability: checker.target_root_mutability,
+        binding,
+    })
 }
 
 #[derive(Debug, Clone, Default)]

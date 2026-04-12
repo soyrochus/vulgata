@@ -205,16 +205,18 @@ Vulgata also provides a small interactive REPL:
 vulgata repl
 ```
 
-The REPL keeps an in-memory virtual source file. Submit a source block with a trailing empty line, then use commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit`.
+The REPL keeps an in-memory virtual source file for declarations and also maintains session-local `let`/`var` bindings. Submit a declaration block with a trailing empty line to extend the session source, submit an expression block to evaluate it against the current session, or submit `let`/`var`/`:=` statements to work with REPL-local bindings. Commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit` remain available.
 
 Example session:
 
 ```text
-> action main() -> Int:
-|   return 42
+> action add(a: Int, b: Int) -> Int:
+|   return a + b
 |
 ok: block added
-> :run
+> let answer = add(20, 22)
+answer = Int(42)
+> answer
 Int(42)
 ```
 

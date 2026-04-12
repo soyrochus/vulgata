@@ -40,7 +40,10 @@ struct Fixture {
 #[test]
 fn conformance_fixtures_pass() {
     let fixtures = load_fixtures().expect("load fixtures");
-    assert!(!fixtures.is_empty(), "expected at least one conformance fixture");
+    assert!(
+        !fixtures.is_empty(),
+        "expected at least one conformance fixture"
+    );
 
     for fixture in fixtures {
         assert_fixture(&fixture);
@@ -165,7 +168,10 @@ fn assert_fixture(fixture: &Fixture) {
                         fixture.name
                     );
                 } else {
-                    panic!("fixture `{}` compile unexpectedly failed: {}", fixture.name, error);
+                    panic!(
+                        "fixture `{}` compile unexpectedly failed: {}",
+                        fixture.name, error
+                    );
                 }
             }
         }
@@ -188,9 +194,12 @@ fn assert_fixture(fixture: &Fixture) {
 }
 
 fn execute_interpreter(fixture: &Fixture) -> Result<String, String> {
-    let mode = fixture
-        .mode
-        .unwrap_or_else(|| panic!("fixture `{}` missing mode for interpreter execution", fixture.name));
+    let mode = fixture.mode.unwrap_or_else(|| {
+        panic!(
+            "fixture `{}` missing mode for interpreter execution",
+            fixture.name
+        )
+    });
 
     if let Some(externs) = &fixture.externs {
         let lowered = vulgata::lower_source(&fixture.source_path, &fixture.source)
@@ -201,8 +210,8 @@ fn execute_interpreter(fixture: &Fixture) -> Result<String, String> {
             Some(externs),
         )
         .map_err(|diagnostics| format_diagnostics(&diagnostics))?;
-        let interpreter =
-            Interpreter::with_externs(&lowered, registry).map_err(|diagnostics| format_diagnostics(&diagnostics))?;
+        let interpreter = Interpreter::with_externs(&lowered, registry)
+            .map_err(|diagnostics| format_diagnostics(&diagnostics))?;
         return match mode {
             Mode::Run => interpreter
                 .run_main()
@@ -229,7 +238,9 @@ fn execute_compiled(fixture: &Fixture) -> Result<String, String> {
     let emitted = vulgata::compile_source(&fixture.source_path, &fixture.source)
         .map_err(|diagnostics| format_diagnostics(&diagnostics))?;
 
-    let dir = std::env::temp_dir().join("vulgata-conformance").join(&fixture.name);
+    let dir = std::env::temp_dir()
+        .join("vulgata-conformance")
+        .join(&fixture.name);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let source_path = dir.join("generated.rs");
     let binary_path = dir.join("generated-bin");
@@ -308,14 +319,14 @@ fn load_fixtures() -> Result<Vec<Fixture>, String> {
         let config = parse_config(&config_text)?;
 
         let externs_path = path.join("externs.toml");
-        let externs = if externs_path.exists() {
-            Some(
-                fs::read_to_string(&externs_path)
-                    .map_err(|error| format!("failed to read {}: {error}", externs_path.display()))?,
-            )
-        } else {
-            None
-        };
+        let externs =
+            if externs_path.exists() {
+                Some(fs::read_to_string(&externs_path).map_err(|error| {
+                    format!("failed to read {}: {error}", externs_path.display())
+                })?)
+            } else {
+                None
+            };
 
         fixtures.push(Fixture {
             name: path
@@ -325,12 +336,29 @@ fn load_fixtures() -> Result<Vec<Fixture>, String> {
                 .to_string(),
             source_path,
             source,
-            externs_path: if externs.is_some() { Some(externs_path) } else { None },
+            externs_path: if externs.is_some() {
+                Some(externs_path)
+            } else {
+                None
+            },
             externs,
-            mode: config.get("mode").map(|value| parse_mode(value)).transpose()?,
-            parse_status: parse_status(config.get("parse_status").map(String::as_str).unwrap_or("ok"))?,
+            mode: config
+                .get("mode")
+                .map(|value| parse_mode(value))
+                .transpose()?,
+            parse_status: parse_status(
+                config
+                    .get("parse_status")
+                    .map(String::as_str)
+                    .unwrap_or("ok"),
+            )?,
             parse_error: config.get("parse_error").cloned(),
-            check_status: parse_status(config.get("check_status").map(String::as_str).unwrap_or("ok"))?,
+            check_status: parse_status(
+                config
+                    .get("check_status")
+                    .map(String::as_str)
+                    .unwrap_or("ok"),
+            )?,
             check_error: config.get("check_error").cloned(),
             run_output: config.get("run_output").cloned(),
             run_error: config.get("run_error").cloned(),
@@ -373,7 +401,9 @@ fn parse_value(raw: &str) -> Result<String, String> {
                 continue;
             }
 
-            let escaped = chars.next().ok_or_else(|| "unterminated escape sequence".to_string())?;
+            let escaped = chars
+                .next()
+                .ok_or_else(|| "unterminated escape sequence".to_string())?;
             match escaped {
                 'n' => value.push('\n'),
                 'r' => value.push('\r'),

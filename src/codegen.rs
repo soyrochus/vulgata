@@ -306,7 +306,8 @@ fn lower_block(
     in_test: bool,
     reassigned: &HashSet<String>,
 ) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
-    block.iter()
+    block
+        .iter()
         .map(|stmt| lower_stmt(stmt, in_test, reassigned))
         .collect()
 }
@@ -555,13 +556,15 @@ fn lower_symbol(
 ) -> Result<RustExpr, Vec<Diagnostic>> {
     match symbol.kind {
         Some(SymbolKind::Const) => Ok(RustExpr::raw(format!("{}()", const_fn_name(&symbol.name)))),
-        Some(SymbolKind::Action) | Some(SymbolKind::Extern) | Some(SymbolKind::Runtime) => Err(vec![codegen_error(
-            span,
-            format!(
-                "first-class callable `{}` is not supported by compile mode yet",
-                symbol.name
-            ),
-        )]),
+        Some(SymbolKind::Action) | Some(SymbolKind::Extern) | Some(SymbolKind::Runtime) => {
+            Err(vec![codegen_error(
+                span,
+                format!(
+                    "first-class callable `{}` is not supported by compile mode yet",
+                    symbol.name
+                ),
+            )])
+        }
         _ => Ok(RustExpr::raw(snapshot_expr(&symbol.name, ty))),
     }
 }
@@ -790,7 +793,9 @@ fn entrypoint_item(module: &TypedIrModule) -> Result<RustItem, Vec<Diagnostic>> 
         })
         .collect::<Vec<_>>();
     let main_action = module.declarations.iter().find_map(|decl| match decl {
-        TypedDecl::Action(action) if action.name == "main" && action.params.is_empty() => Some(action),
+        TypedDecl::Action(action) if action.name == "main" && action.params.is_empty() => {
+            Some(action)
+        }
         _ => None,
     });
 
@@ -862,7 +867,11 @@ fn render_item(item: &RustItem, indent: usize, output: &mut String) {
                 );
             }
             line(indent, "}", output);
-            line(indent, &format!("impl support::Snapshot for {name} {{"), output);
+            line(
+                indent,
+                &format!("impl support::Snapshot for {name} {{"),
+                output,
+            );
             line(indent + 1, "fn snapshot(&self) -> Self {", output);
             line(indent + 2, &format!("{name} {{"), output);
             for (field, _) in fields {
@@ -883,7 +892,11 @@ fn render_item(item: &RustItem, indent: usize, output: &mut String) {
                 line(indent + 1, &format!("{variant},"), output);
             }
             line(indent, "}", output);
-            line(indent, &format!("impl support::Snapshot for {name} {{"), output);
+            line(
+                indent,
+                &format!("impl support::Snapshot for {name} {{"),
+                output,
+            );
             line(indent + 1, "fn snapshot(&self) -> Self {", output);
             line(indent + 2, "self.clone()", output);
             line(indent + 1, "}", output);
@@ -1524,7 +1537,14 @@ action main() -> Text:
         let output = Command::new(&binary_path)
             .output()
             .expect("run generated binary");
-        assert!(output.status.success(), "binary failed with status {:?}", output.status);
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Text(\"before\")");
+        assert!(
+            output.status.success(),
+            "binary failed with status {:?}",
+            output.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "Text(\"before\")"
+        );
     }
 }

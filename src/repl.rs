@@ -1,15 +1,19 @@
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::ast::Decl;
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
-use crate::runtime::TestResult;
+use crate::runtime::{TestResult, Value};
+use crate::types::ReplBinding;
 
 const REPL_PATH: &str = "<repl>/session.vg";
 
 pub struct ReplSession {
     path: PathBuf,
     source: String,
+    bindings: HashMap<String, ReplBinding>,
+    values: HashMap<String, Value>,
 }
 
 #[derive(Debug)]
@@ -23,6 +27,8 @@ impl ReplSession {
         Self {
             path: PathBuf::from(REPL_PATH),
             source: String::new(),
+            bindings: HashMap::new(),
+            values: HashMap::new(),
         }
     }
 
@@ -45,14 +51,36 @@ impl ReplSession {
         Ok("ok: block added".to_string())
     }
 
+    pub fn submit_input(&mut self, input: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+        if looks_like_declaration(input) {
+            return self.submit_block(input).map(|message| vec![message]);
+        }
+
+        self.ensure_repl_execution_supported()?;
+        if crate::parse_expression_source(&self.path, input).is_ok() {
+            let value = crate::eval_expression_source_with_bindings(
+                &self.path,
+                &self.source,
+                input,
+                &self.bindings,
+                &self.values,
+            )?;
+            Ok(vec![format!("{value:?}")])
+        } else {
+            self.submit_statement(input)
+        }
+    }
+
     pub fn handle_command(&mut self, command: &str) -> Result<ReplCommand, Vec<Diagnostic>> {
         match command.trim() {
             ":help" => Ok(ReplCommand::Continue(vec![help_text().to_string()])),
-            ":show" => Ok(ReplCommand::Continue(vec![if self.source.trim().is_empty() {
-                "(empty session)".to_string()
-            } else {
-                self.source.clone()
-            }])),
+            ":show" => Ok(ReplCommand::Continue(vec![
+                if self.source.trim().is_empty() {
+                    "(empty session)".to_string()
+                } else {
+                    self.source.clone()
+                },
+            ])),
             ":reset" => {
                 self.source.clear();
                 Ok(ReplCommand::Continue(vec!["session reset".to_string()]))
@@ -103,6 +131,30 @@ impl ReplSession {
         }
         Ok(())
     }
+
+    fn submit_statement(&mut self, input: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+        let stmt = crate::parse_statement_source(&self.path, input)?;
+        let checked = crate::check_source(&self.path, &self.source)?;
+        let checked_stmt = crate::types::check_statement(&checked, &stmt, &self.bindings)?;
+        let typed_stmt = crate::tir::lower_statement(&checked, &stmt, &checked_stmt)?;
+        let lowered = crate::tir::lower_module(&checked)?;
+        let interpreter = crate::runtime::Interpreter::new(&lowered)?;
+        interpreter.execute_repl_statement(&typed_stmt, &mut self.values)?;
+
+        if let Some((name, binding)) = checked_stmt.binding {
+            self.bindings.insert(name.clone(), binding);
+            let value = self.values.get(&name).cloned().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    SourceSpan::for_path(&self.path, 1, 1),
+                    Phase::Cli,
+                    format!("missing runtime value for repl binding `{name}`"),
+                )]
+            })?;
+            return Ok(vec![format!("{name} = {value:?}")]);
+        }
+
+        Ok(vec!["ok".to_string()])
+    }
 }
 
 pub fn run_repl<R: BufRead, W: Write>(
@@ -151,8 +203,12 @@ pub fn run_repl<R: BufRead, W: Write>(
             }
 
             let block = pending.join("\n");
-            match session.submit_block(&block) {
-                Ok(message) => writeln!(output, "{message}").map_err(io_diag)?,
+            match session.submit_input(&block) {
+                Ok(lines) => {
+                    for line in lines {
+                        writeln!(output, "{line}").map_err(io_diag)?;
+                    }
+                }
                 Err(diagnostics) => {
                     for diagnostic in diagnostics {
                         writeln!(output, "{diagnostic}").map_err(io_diag)?;
@@ -185,7 +241,24 @@ fn format_test_results(results: &[TestResult]) -> Vec<String> {
 }
 
 fn help_text() -> &'static str {
-    "Commands: :help :show :reset :parse :check :run :test :quit\nSubmit a source block with an empty line."
+    "Commands: :help :show :reset :parse :check :run :test :quit\nEnter declarations to extend the session source, or enter an expression to evaluate it.\nSubmit a source block with an empty line."
+}
+
+fn looks_like_declaration(input: &str) -> bool {
+    matches!(
+        input.trim_start().split_whitespace().next(),
+        Some(
+            "module"
+                | "import"
+                | "from"
+                | "const"
+                | "record"
+                | "enum"
+                | "extern"
+                | "action"
+                | "test"
+        )
+    )
 }
 
 fn io_diag(error: std::io::Error) -> Vec<Diagnostic> {
@@ -200,7 +273,7 @@ fn io_diag(error: std::io::Error) -> Vec<Diagnostic> {
 mod tests {
     use std::io::Cursor;
 
-    use super::{run_repl, ReplCommand, ReplSession};
+    use super::{ReplCommand, ReplSession, run_repl};
 
     #[test]
     fn accepts_valid_block_and_shows_source() {
@@ -274,5 +347,58 @@ mod tests {
         assert!(rendered.contains("vulgata repl"));
         assert!(rendered.contains("ok: block added"));
         assert!(rendered.contains("Int(7)"));
+    }
+
+    #[test]
+    fn evaluates_expression_input_without_mutating_session() {
+        let mut session = ReplSession::new();
+        session
+            .submit_block("action add(a: Int, b: Int) -> Int:\n  return a + b")
+            .expect("submit");
+
+        let before = session.source().to_string();
+        let lines = session.submit_input("add(2, 3)").expect("eval");
+        assert_eq!(lines, vec!["Int(5)"]);
+        assert_eq!(session.source(), before);
+    }
+
+    #[test]
+    fn supports_repl_local_let_bindings() {
+        let mut session = ReplSession::new();
+        session
+            .submit_block("record Point:\n  x: Dec\n  y: Dec")
+            .expect("submit");
+
+        let lines = session
+            .submit_input("let r = Point(x: 0.0, y: 0.0)")
+            .expect("let");
+        assert_eq!(
+            lines,
+            vec!["r = Record({\"x\": Dec(0.0), \"y\": Dec(0.0)})"]
+        );
+
+        let lines = session.submit_input("r.x").expect("eval");
+        assert_eq!(lines, vec!["Dec(0.0)"]);
+    }
+
+    #[test]
+    fn supports_repl_local_var_assignment() {
+        let mut session = ReplSession::new();
+        session.submit_input("var n = 1").expect("var");
+        let lines = session.submit_input("n := n + 1").expect("assign");
+        assert_eq!(lines, vec!["ok"]);
+        let lines = session.submit_input("n").expect("eval");
+        assert_eq!(lines, vec!["Int(2)"]);
+    }
+
+    #[test]
+    fn interactive_loop_evaluates_expression_input() {
+        let input = b"action add(a: Int, b: Int) -> Int:\n  return a + b\n\nadd(4, 5)\n\n:quit\n";
+        let mut input = Cursor::new(&input[..]);
+        let mut output = Vec::new();
+        run_repl(&mut input, &mut output).expect("repl");
+        let rendered = String::from_utf8(output).expect("utf8");
+        assert!(rendered.contains("ok: block added"));
+        assert!(rendered.contains("Int(9)"));
     }
 }

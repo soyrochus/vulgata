@@ -158,6 +158,37 @@ impl<'a> Interpreter<'a> {
         Ok(results)
     }
 
+    pub fn eval_expression(&self, expr: &TypedExpr) -> Result<Value, Vec<Diagnostic>> {
+        let mut env = self.globals.clone();
+        self.eval_expr(expr, &mut env)
+    }
+
+    pub fn eval_expression_with_env(
+        &self,
+        expr: &TypedExpr,
+        env: &HashMap<String, Value>,
+    ) -> Result<Value, Vec<Diagnostic>> {
+        let mut env = env.clone();
+        self.eval_expr(expr, &mut env)
+    }
+
+    pub fn execute_repl_statement(
+        &self,
+        stmt: &TypedStmt,
+        env: &mut HashMap<String, Value>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut failures = Vec::new();
+        match self.execute_stmt(stmt, env, &mut failures)? {
+            ExecFlow::Continue => Ok(()),
+            ExecFlow::Return(_) | ExecFlow::Break | ExecFlow::ContinueLoop => {
+                Err(vec![runtime_error(
+                    &stmt.span,
+                    "repl statement may not use return, break, or continue",
+                )])
+            }
+        }
+    }
+
     fn call_action(&self, name: &str, args: Vec<Value>) -> Result<Value, Vec<Diagnostic>> {
         if let Some(action) = standard_runtime::lookup_standard_runtime_name(name) {
             return self.call_standard_runtime(action, args, &self.module.span);
@@ -545,12 +576,14 @@ impl<'a> Interpreter<'a> {
         env: &mut HashMap<String, Value>,
     ) -> Result<Value, Vec<Diagnostic>> {
         match target {
-            TypedTarget::Name { symbol, span, .. } => env.get(&symbol.name).cloned().ok_or_else(|| {
-                vec![runtime_error(
-                    span,
-                    format!("unknown runtime symbol `{}`", symbol.name),
-                )]
-            }),
+            TypedTarget::Name { symbol, span, .. } => {
+                env.get(&symbol.name).cloned().ok_or_else(|| {
+                    vec![runtime_error(
+                        span,
+                        format!("unknown runtime symbol `{}`", symbol.name),
+                    )]
+                })
+            }
             TypedTarget::Field {
                 base, field, span, ..
             } => match self.read_target(base, env)? {

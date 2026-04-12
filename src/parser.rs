@@ -57,6 +57,30 @@ impl Parser {
         })
     }
 
+    pub fn parse_expression(mut self) -> Result<Expr, Vec<Diagnostic>> {
+        self.skip_newlines();
+        let expr = self.parse_expr()?;
+        self.skip_newlines();
+        if !self.at(&Token::Eof) {
+            return Err(vec![
+                self.error_here("expected end of input after expression"),
+            ]);
+        }
+        Ok(expr)
+    }
+
+    pub fn parse_statement(mut self) -> Result<Stmt, Vec<Diagnostic>> {
+        self.skip_newlines();
+        let stmt = self.parse_stmt()?;
+        self.skip_newlines();
+        if !self.at(&Token::Eof) {
+            return Err(vec![
+                self.error_here("expected end of input after statement"),
+            ]);
+        }
+        Ok(stmt)
+    }
+
     fn parse_module_decl(&mut self) -> Result<ModuleDecl, Vec<Diagnostic>> {
         let span = self.expect_simple(Token::Module, "expected `module`")?.span;
         let name = self.parse_module_name()?;
@@ -1162,7 +1186,7 @@ test main_basic:
             .expect("tokenize");
         let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
             .parse_module()
-        .expect_err("parse should fail");
+            .expect_err("parse should fail");
         assert!(!diagnostics.is_empty());
         assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Parse);
     }

@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use crate::ast::{BinaryOp, CallArg, Decl, Expr, ExprKind, Stmt, StmtKind, Target, UnaryOp};
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
 use crate::standard_runtime;
-use crate::types::{CheckedModule, Type};
+use crate::types::{CheckedModule, CheckedStmt, Type};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedIrModule {
@@ -204,6 +206,32 @@ pub fn lower_module(checked: &CheckedModule) -> Result<TypedIrModule, Vec<Diagno
         declarations,
         span: checked.module.span.clone(),
     })
+}
+
+pub fn lower_expression(
+    checked: &CheckedModule,
+    expr: &Expr,
+    expr_types: &HashMap<u32, Type>,
+) -> Result<TypedExpr, Vec<Diagnostic>> {
+    let mut checked = checked.clone();
+    checked.expr_types.extend(expr_types.clone());
+    lower_expr(&checked, expr)
+}
+
+pub fn lower_statement(
+    checked: &CheckedModule,
+    stmt: &Stmt,
+    checked_stmt: &CheckedStmt,
+) -> Result<TypedStmt, Vec<Diagnostic>> {
+    let mut checked = checked.clone();
+    checked.expr_types.extend(checked_stmt.expr_types.clone());
+    checked
+        .target_types
+        .extend(checked_stmt.target_types.clone());
+    checked
+        .target_root_mutability
+        .extend(checked_stmt.target_root_mutability.clone());
+    lower_stmt(&checked, stmt)
 }
 
 fn lower_decl(checked: &CheckedModule, decl: &Decl) -> Result<TypedDecl, Vec<Diagnostic>> {
@@ -529,13 +557,17 @@ fn lookup_target_writable(
     checked: &CheckedModule,
     span: &SourceSpan,
 ) -> Result<bool, Vec<Diagnostic>> {
-    checked.target_root_mutability.get(span).copied().ok_or_else(|| {
-        vec![Diagnostic::new(
-            span.clone(),
-            Phase::Lower,
-            "missing lowered target mutability",
-        )]
-    })
+    checked
+        .target_root_mutability
+        .get(span)
+        .copied()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                span.clone(),
+                Phase::Lower,
+                "missing lowered target mutability",
+            )]
+        })
 }
 
 fn lower_type_ref(

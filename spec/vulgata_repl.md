@@ -35,7 +35,6 @@ The REPL should provide:
 
 The initial REPL does not aim to provide:
 
-* a separate expression-only language
 * a dynamic interpreter mode with semantics different from ordinary Vulgata modules
 * ad hoc runtime mutation that bypasses parsing, type checking, or typed IR lowering
 * compile-mode execution inside the interactive loop
@@ -71,9 +70,9 @@ There is no interactive mode, no persistent session state, and no command for in
 
 ## 4.3 Consequence for the REPL design
 
-Because the current parser and interpreter are module-oriented, the REPL should be specified as a **session that maintains a virtual source file**.
+Because the current parser and interpreter are module-oriented, the REPL should be specified as a **session that maintains a virtual source file** together with expression evaluation against that source.
 
-Each accepted input block becomes part of that virtual module. Parsing, checking, lowering, and execution still operate on ordinary Vulgata source assembled from the session buffer.
+Accepted declaration blocks become part of that virtual module. Expression input is parsed, checked, lowered, and executed against the current session buffer without mutating it.
 
 This keeps the REPL aligned with the v0.2 language rather than introducing a special-case interactive grammar.
 
@@ -121,13 +120,17 @@ The exact spelling is an implementation choice, but it must be stable within a s
 
 ## 6.2 Source truth
 
-The accumulated session buffer is the canonical source of truth for the REPL.
+The accumulated session buffer is the canonical source of truth for top-level declarations in the REPL.
 
-The REPL shall not maintain hidden interpreter-only declarations that are absent from the session source.
+In addition, the REPL may maintain session-local bindings introduced through interactive `let` and `var` input.
+
+Those bindings are not top-level declarations and therefore are not required to appear in `:show`.
 
 ## 6.3 Persistence within a session
 
 Top-level declarations entered successfully remain available for later `run`, `test`, `check`, and inspection commands until the session is reset or exited.
+
+Session-local bindings entered successfully through `let` or `var` remain available to later interactive expressions and assignments until the session is reset or exited.
 
 ## 6.4 No persistence across sessions in MVP
 
@@ -139,9 +142,11 @@ The initial REPL does not need automatic save/load behavior between process invo
 
 ## 7.1 Accepted unit
 
-The REPL accepts one **source block** at a time.
+The REPL accepts one **input block** at a time.
 
-A source block is ordinary Vulgata source text containing one or more top-level declarations, for example:
+An input block is either:
+
+* ordinary Vulgata source text containing one or more top-level declarations, for example:
 
 * `const`
 * `record`
@@ -151,6 +156,14 @@ A source block is ordinary Vulgata source text containing one or more top-level 
 * `test`
 * optional `module`
 * optional `import`
+* or an ordinary Vulgata expression, such as:
+* `1 + 2`
+* `add(20, 22)`
+* `file.exists("README.md")`
+* or a REPL-local statement, such as:
+* `let p = Point(x: 0.0, y: 0.0)`
+* `var total = 1`
+* `total := total + 1`
 
 ## 7.2 Multi-line entry
 
@@ -166,7 +179,7 @@ The exact input UX may vary, but block completion must be explicit and predictab
 
 ## 7.3 Successful append semantics
 
-When a source block parses and checks successfully in the context of the existing session buffer, the REPL appends it to the session source.
+When a declaration block parses and checks successfully in the context of the existing session buffer, the REPL appends it to the session source.
 
 If the block fails validation, it shall not mutate session state.
 
@@ -174,9 +187,27 @@ This prevents a broken block from partially corrupting the current interactive m
 
 ## 7.4 Bare expressions
 
-Bare expressions are out of scope for the MVP.
+Bare expressions are part of the MVP.
 
-The initial REPL is declaration-oriented because the current parser and interpreter operate on module-shaped input. Expression evaluation may be added later through an explicit synthetic wrapper strategy, but that is not required for the first version.
+When an input block is not a declaration block, the REPL shall attempt to parse it as an expression.
+
+If expression parsing and checking succeed, the REPL shall evaluate that expression against the current session module and print the resulting value.
+
+Expression evaluation shall not mutate the accumulated session source.
+
+## 7.5 REPL-local statements
+
+The MVP REPL also supports interactive local statements:
+
+* `let`
+* `var`
+* `:=`
+
+Those statements are checked against the current session module plus any already-established REPL-local bindings.
+
+Successful `let` and `var` statements create bindings that persist for the rest of the REPL session unless reset.
+
+Successful `:=` statements update existing mutable REPL-local bindings using the same mutability rules as ordinary Vulgata action bodies.
 
 ---
 
@@ -250,30 +281,49 @@ The REPL shall use the same front-end stages as file execution:
 3. resolution
 4. type checking
 5. typed IR lowering
-6. interpreter execution for `:run` and `:test`
+6. interpreter execution for `:run`, `:test`, and evaluated expressions
 
 No REPL-only semantic shortcuts are permitted.
 
 ## 9.2 Session updates
 
-Adding a source block should follow this flow:
+Adding a declaration block should follow this flow:
 
 1. concatenate the current session buffer with the candidate block
 2. parse and check the combined source
 3. if successful, commit the new source buffer
 4. if unsuccessful, keep the previous source buffer unchanged and print diagnostics
 
+Evaluating an expression block should follow this flow:
+
+1. keep the current session buffer unchanged
+2. parse the candidate input as an expression
+3. type-check that expression against the current session module
+4. lower the expression using the shared typed IR machinery
+5. evaluate it with a fresh interpreter built from the current session source
+6. print the resulting value
+
+Executing a REPL-local statement should follow this flow:
+
+1. keep the current session source unchanged
+2. parse the candidate input as a statement
+3. type-check that statement against the current session module plus existing REPL-local bindings
+4. lower the statement using the shared typed IR machinery
+5. execute it against the persistent REPL-local environment
+6. if it succeeds, commit any new or updated REPL-local bindings
+
 ## 9.3 Runtime state
 
-The MVP REPL shall be **source-persistent, not heap-persistent**.
+The MVP REPL shall be **source-persistent for declarations and binding-persistent for interactive local state**.
 
 That means:
 
 * declarations remain in the accumulated source buffer
 * `:run` and `:test` build a fresh typed IR and a fresh interpreter from that buffer
-* runtime locals from a prior `:run` invocation do not survive into the next invocation unless they are represented in source
+* REPL-local `let` and `var` bindings survive across later interactive inputs
+* runtime locals from a prior `:run` invocation do not survive into the next invocation unless they are represented in source or in REPL-local bindings
 
-This matches the current architecture cleanly and avoids inventing a second execution model.
+This keeps declaration execution aligned with the ordinary module model while still allowing practical interactive exploration.
 
 ## 9.4 Main action rule
 
@@ -319,6 +369,8 @@ The initial version should support:
 * running `main`
 * running tests
 * inspecting the accumulated source
+* evaluating expressions and action calls against the current session
+* maintaining REPL-local `let` and `var` bindings for interactive work
 
 The initial version does not need to support:
 
@@ -360,7 +412,7 @@ type :help for commands
 |
 ok: block added
 
-> :run
+> main()
 Int(42)
 
 > test smoke:
@@ -396,7 +448,6 @@ After the MVP, the REPL may grow to support:
 * `:load <file>` to seed the session from an existing source file
 * `:save <file>` to write the current session buffer
 * `:externs <file>` to attach extern bindings
-* expression evaluation through an explicit synthetic wrapper strategy
 * undo of the most recently accepted block
 
 None of those extensions should violate the central rule that the REPL remains a structured interface over ordinary Vulgata source and the shared front-end pipeline.
@@ -411,6 +462,6 @@ That design:
 
 * fits the current implementation
 * preserves the shared-pipeline rule from the v0.2 language spec
-* avoids inventing a second language semantics
+* allows interactive evaluation without inventing a second language semantics
 * provides a practical interactive workflow
 * leaves room for richer commands later without compromising consistency

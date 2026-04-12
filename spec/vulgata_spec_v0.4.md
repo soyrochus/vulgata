@@ -164,14 +164,17 @@ Interactive command:
 vulgata repl
 ```
 
-The REPL is declaration-oriented and backed by a virtual source file for the current session.
+The REPL is backed by a virtual source file for the current session, accepts both declarations and expressions, and supports session-local bindings through `let`, `var`, and `:=`.
 
 It follows these rules:
 
 * source blocks are accepted only after the combined session source parses and checks successfully
-* accepted blocks become part of the session source
+* accepted declaration blocks become part of the session source
+* expression blocks are checked against the current session source and evaluated without mutating it
+* `let` and `var` input create REPL-local session bindings that are available to later expressions and assignments
+* `:=` updates previously introduced mutable REPL bindings according to the same mutability rules used inside actions
 * `:run` and `:test` rebuild a fresh interpreter from the current session source
-* session state is source-persistent, not heap-persistent
+* session state includes both source-persistent declarations and REPL-local bindings
 
 Core REPL commands:
 
