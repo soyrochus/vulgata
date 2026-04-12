@@ -2,6 +2,6 @@ record Customer:
   email: Text
 
 action main() -> Text:
-  var customer = Customer(email: "before")
+  let customer = Customer(email: "before")
   customer.email := "after"
   return customer.email

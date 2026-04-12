@@ -273,7 +273,7 @@ impl Parser {
         let span = self.current_span();
         let kind = match self.current_token() {
             Token::Let => self.parse_let_stmt()?,
-            Token::Set => self.parse_set_stmt()?,
+            Token::Var => self.parse_var_stmt()?,
             Token::If => self.parse_if_stmt()?,
             Token::While => self.parse_while_stmt()?,
             Token::For => self.parse_for_stmt()?,
@@ -295,9 +295,17 @@ impl Parser {
                 StmtKind::Expect(expr)
             }
             _ => {
-                let expr = self.parse_expr()?;
-                self.expect_newline("expected newline after expression")?;
-                StmtKind::Expr(expr)
+                if self.is_legacy_set_stmt() {
+                    return Err(vec![self.error_here(
+                        "legacy `set target = value` syntax is not supported; use `target := value`",
+                    )]);
+                } else if self.is_assignment_stmt() {
+                    self.parse_assign_stmt()?
+                } else {
+                    let expr = self.parse_expr()?;
+                    self.expect_newline("expected newline after expression")?;
+                    StmtKind::Expr(expr)
+                }
             }
         };
 
@@ -327,13 +335,31 @@ impl Parser {
         })
     }
 
-    fn parse_set_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
-        self.expect_simple(Token::Set, "expected `set`")?;
-        let target = self.parse_target()?;
-        self.expect_simple(Token::Assign, "expected `=` in set statement")?;
+    fn parse_var_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Var, "expected `var`")?;
+        let name = self.expect_identifier("expected variable name")?;
+        let explicit_type = if self.at(&Token::Colon) {
+            self.bump();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect_simple(Token::Assign, "expected `=` in var statement")?;
         let value = self.parse_expr()?;
-        self.expect_newline("expected newline after set statement")?;
-        Ok(StmtKind::Set { target, value })
+        self.expect_newline("expected newline after var statement")?;
+        Ok(StmtKind::Var {
+            name,
+            explicit_type,
+            value,
+        })
+    }
+
+    fn parse_assign_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        let target = self.parse_target()?;
+        self.expect_simple(Token::ColonAssign, "expected `:=` in assignment statement")?;
+        let value = self.parse_expr()?;
+        self.expect_newline("expected newline after assignment statement")?;
+        Ok(StmtKind::Assign { target, value })
     }
 
     fn parse_if_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
@@ -445,6 +471,113 @@ impl Parser {
         }
 
         Ok(target)
+    }
+
+    fn is_assignment_stmt(&self) -> bool {
+        let mut cursor = self.position;
+        if !matches!(
+            self.tokens.get(cursor).map(|token| &token.token),
+            Some(Token::Identifier(_))
+        ) {
+            return false;
+        }
+        cursor += 1;
+        loop {
+            match self.tokens.get(cursor).map(|token| &token.token) {
+                Some(Token::Dot) => {
+                    cursor += 1;
+                    if !matches!(
+                        self.tokens.get(cursor).map(|token| &token.token),
+                        Some(Token::Identifier(_))
+                    ) {
+                        return false;
+                    }
+                    cursor += 1;
+                }
+                Some(Token::LBracket) => {
+                    cursor += 1;
+                    let mut depth = 1usize;
+                    while let Some(token) = self.tokens.get(cursor).map(|token| &token.token) {
+                        match token {
+                            Token::LBracket => depth += 1,
+                            Token::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    cursor += 1;
+                                    break;
+                                }
+                            }
+                            Token::Eof | Token::Newline => return false,
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                    if depth != 0 {
+                        return false;
+                    }
+                }
+                Some(Token::ColonAssign) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    fn is_legacy_set_stmt(&self) -> bool {
+        let mut cursor = self.position;
+        if !matches!(
+            self.tokens.get(cursor).map(|token| &token.token),
+            Some(Token::Identifier(name)) if name == "set"
+        ) {
+            return false;
+        }
+
+        cursor += 1;
+        if !matches!(
+            self.tokens.get(cursor).map(|token| &token.token),
+            Some(Token::Identifier(_))
+        ) {
+            return false;
+        }
+        cursor += 1;
+
+        loop {
+            match self.tokens.get(cursor).map(|token| &token.token) {
+                Some(Token::Dot) => {
+                    cursor += 1;
+                    if !matches!(
+                        self.tokens.get(cursor).map(|token| &token.token),
+                        Some(Token::Identifier(_))
+                    ) {
+                        return false;
+                    }
+                    cursor += 1;
+                }
+                Some(Token::LBracket) => {
+                    cursor += 1;
+                    let mut depth = 1usize;
+                    while let Some(token) = self.tokens.get(cursor).map(|token| &token.token) {
+                        match token {
+                            Token::LBracket => depth += 1,
+                            Token::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    cursor += 1;
+                                    break;
+                                }
+                            }
+                            Token::Eof | Token::Newline => return false,
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                    if depth != 0 {
+                        return false;
+                    }
+                }
+                Some(Token::Assign) => return true,
+                _ => return false,
+            }
+        }
     }
 
     fn parse_expr(&mut self) -> Result<Expr, Vec<Diagnostic>> {
@@ -977,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_valid_program_with_set_test_and_expect() {
+    fn parses_valid_program_with_var_assign_test_and_expect() {
         let module = parse(
             r#"
 module demo.core
@@ -986,7 +1119,8 @@ record Customer:
   email: Text
 
 action main(customer: Customer) -> Int:
-  set customer.email = "updated"
+  var current = customer
+  current.email := "updated"
   return 1
 
 test main_basic:
@@ -997,7 +1131,14 @@ test main_basic:
         assert_eq!(module.declarations.len(), 3);
         match &module.declarations[1] {
             Decl::Action(action) => match &action.body[0].kind {
-                StmtKind::Set { target, .. } => match target {
+                StmtKind::Var { name, .. } => assert_eq!(name, "current"),
+                other => panic!("unexpected statement: {other:?}"),
+            },
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+        match &module.declarations[1] {
+            Decl::Action(action) => match &action.body[1].kind {
+                StmtKind::Assign { target, .. } => match target {
                     Target::Field { field, .. } => assert_eq!(field, "email"),
                     other => panic!("unexpected target: {other:?}"),
                 },
@@ -1021,8 +1162,27 @@ test main_basic:
             .expect("tokenize");
         let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
             .parse_module()
-            .expect_err("parse should fail");
+        .expect_err("parse should fail");
         assert!(!diagnostics.is_empty());
         assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Parse);
+    }
+
+    #[test]
+    fn rejects_legacy_set_syntax() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main() -> Int:\n  var total = 1\n  set total = total + 1\n  return total\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Parse);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("legacy `set target = value` syntax is not supported")
+        );
     }
 }

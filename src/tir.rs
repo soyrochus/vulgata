@@ -78,7 +78,12 @@ pub enum TypedStmtKind {
         ty: Type,
         value: TypedExpr,
     },
-    Set {
+    Var {
+        name: String,
+        ty: Type,
+        value: TypedExpr,
+    },
+    Assign {
         target: TypedTarget,
         value: TypedExpr,
     },
@@ -107,18 +112,21 @@ pub enum TypedTarget {
     Name {
         symbol: TypedSymbol,
         ty: Type,
+        writable_root: bool,
         span: SourceSpan,
     },
     Field {
         base: Box<TypedTarget>,
         field: String,
         ty: Type,
+        writable_root: bool,
         span: SourceSpan,
     },
     Index {
         base: Box<TypedTarget>,
         index: TypedExpr,
         ty: Type,
+        writable_root: bool,
         span: SourceSpan,
     },
 }
@@ -298,7 +306,20 @@ fn lower_stmt(checked: &CheckedModule, stmt: &Stmt) -> Result<TypedStmt, Vec<Dia
             },
             value: lower_expr(checked, value)?,
         },
-        StmtKind::Set { target, value } => TypedStmtKind::Set {
+        StmtKind::Var {
+            name,
+            explicit_type,
+            value,
+        } => TypedStmtKind::Var {
+            name: name.clone(),
+            ty: if let Some(explicit_type) = explicit_type {
+                lower_type_ref(explicit_type, checked, &stmt.span)?
+            } else {
+                expr_type(checked, value)?
+            },
+            value: lower_expr(checked, value)?,
+        },
+        StmtKind::Assign { target, value } => TypedStmtKind::Assign {
             target: lower_target(checked, target)?,
             value: lower_expr(checked, value)?,
         },
@@ -371,18 +392,21 @@ fn lower_target(checked: &CheckedModule, target: &Target) -> Result<TypedTarget,
                     .map(|symbol| symbol.kind),
             },
             ty: lookup_target_type(checked, span)?,
+            writable_root: lookup_target_writable(checked, span)?,
             span: span.clone(),
         }),
         Target::Field { base, field, span } => Ok(TypedTarget::Field {
             base: Box::new(lower_target(checked, base)?),
             field: field.clone(),
             ty: lookup_target_type(checked, span)?,
+            writable_root: lookup_target_writable(checked, span)?,
             span: span.clone(),
         }),
         Target::Index { base, index, span } => Ok(TypedTarget::Index {
             base: Box::new(lower_target(checked, base)?),
             index: lower_expr(checked, index)?,
             ty: lookup_target_type(checked, span)?,
+            writable_root: lookup_target_writable(checked, span)?,
             span: span.clone(),
         }),
     }
@@ -481,6 +505,19 @@ fn lookup_target_type(checked: &CheckedModule, span: &SourceSpan) -> Result<Type
     })
 }
 
+fn lookup_target_writable(
+    checked: &CheckedModule,
+    span: &SourceSpan,
+) -> Result<bool, Vec<Diagnostic>> {
+    checked.target_root_mutability.get(span).copied().ok_or_else(|| {
+        vec![Diagnostic::new(
+            span.clone(),
+            Phase::Lower,
+            "missing lowered target mutability",
+        )]
+    })
+}
+
 fn lower_type_ref(
     type_ref: &crate::ast::TypeRef,
     checked: &CheckedModule,
@@ -557,13 +594,14 @@ mod tests {
     use super::{TypedDecl, TypedStmtKind, lower_module};
 
     #[test]
-    fn lowers_set_test_and_expect_nodes() {
+    fn lowers_var_assign_test_and_expect_nodes() {
         let source = r#"
 record Customer:
   email: Text
 
 action main(customer: Customer) -> Int:
-  set customer.email = "updated"
+  var current = customer
+  current.email := "updated"
   return 1
 
 test smoke:
@@ -580,7 +618,8 @@ test smoke:
 
         match &lowered.declarations[1] {
             TypedDecl::Action(action) => {
-                assert!(matches!(action.body[0].kind, TypedStmtKind::Set { .. }))
+                assert!(matches!(action.body[0].kind, TypedStmtKind::Var { .. }));
+                assert!(matches!(action.body[1].kind, TypedStmtKind::Assign { .. }));
             }
             other => panic!("unexpected declaration: {other:?}"),
         }

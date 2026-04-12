@@ -1,0 +1,4 @@
+action main() -> Int:
+  var total = 1
+  set total = total + 1
+  return total

@@ -22,7 +22,7 @@ pub enum Token {
     Action,
     Test,
     Let,
-    Set,
+    Var,
     If,
     Elif,
     Else,
@@ -51,6 +51,7 @@ pub enum Token {
     RBrace,
     Arrow,
     Assign,
+    ColonAssign,
     EqualEqual,
     NotEqual,
     Less,
@@ -178,6 +179,9 @@ impl<'a> Lexer<'a> {
             let token = if remaining.starts_with("->") {
                 index += 2;
                 Some(Token::Arrow)
+            } else if remaining.starts_with(":=") {
+                index += 2;
+                Some(Token::ColonAssign)
             } else if remaining.starts_with("==") {
                 index += 2;
                 Some(Token::EqualEqual)
@@ -401,7 +405,7 @@ fn keyword_or_ident(ident: &str) -> Token {
         "action" => Token::Action,
         "test" => Token::Test,
         "let" => Token::Let,
-        "set" => Token::Set,
+        "var" => Token::Var,
         "if" => Token::If,
         "elif" => Token::Elif,
         "else" => Token::Else,
@@ -443,15 +447,16 @@ mod tests {
 
     #[test]
     fn lexes_keywords_operators_and_literals() {
-        let source = "let value = 42 + 1.5\nexpect value != 0\n";
+        let source = "var value = 42 + 1.5\nvalue := value + 1\nexpect value != 0\n";
         let tokens = Lexer::new(Path::new("test.vg"), source)
             .tokenize()
             .expect("tokenize");
-        assert!(kinds(&tokens).contains(&Token::Let));
+        assert!(kinds(&tokens).contains(&Token::Var));
         assert!(kinds(&tokens).contains(&Token::Expect));
         assert!(kinds(&tokens).contains(&Token::IntLiteral(42)));
         assert!(kinds(&tokens).contains(&Token::DecLiteral("1.5".to_string())));
         assert!(kinds(&tokens).contains(&Token::Plus));
+        assert!(kinds(&tokens).contains(&Token::ColonAssign));
         assert!(kinds(&tokens).contains(&Token::NotEqual));
     }
 

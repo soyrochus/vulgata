@@ -174,7 +174,12 @@ pub enum StmtKind {
         explicit_type: Option<TypeRef>,
         value: Expr,
     },
-    Set {
+    Var {
+        name: String,
+        explicit_type: Option<TypeRef>,
+        value: Expr,
+    },
+    Assign {
         target: Target,
         value: Expr,
     },

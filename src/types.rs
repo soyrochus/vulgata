@@ -51,6 +51,7 @@ pub struct CheckedModule {
     pub resolution: Resolution,
     pub expr_types: HashMap<u32, Type>,
     pub target_types: HashMap<SourceSpan, Type>,
+    pub target_root_mutability: HashMap<SourceSpan, bool>,
     pub records: HashMap<String, RecordType>,
     pub actions: HashMap<String, ActionType>,
     pub externs: HashMap<String, ExternSignature>,
@@ -67,6 +68,7 @@ pub struct TypeChecker<'a> {
     constants: HashMap<String, Type>,
     expr_types: HashMap<u32, Type>,
     target_types: HashMap<SourceSpan, Type>,
+    target_root_mutability: HashMap<SourceSpan, bool>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -81,6 +83,7 @@ impl<'a> TypeChecker<'a> {
             constants: HashMap::new(),
             expr_types: HashMap::new(),
             target_types: HashMap::new(),
+            target_root_mutability: HashMap::new(),
         }
     }
 
@@ -116,7 +119,7 @@ impl<'a> TypeChecker<'a> {
                         .clone();
                     let mut scope = Scope::default();
                     for (param, ty) in action.params.iter().zip(signature.params.iter()) {
-                        scope.insert(param.name.clone(), ty.clone());
+                        scope.insert(param.name.clone(), ty.clone(), false);
                     }
                     self.type_block(&action.body, &mut scope, false, &signature.result, 0)?;
                 }
@@ -134,6 +137,7 @@ impl<'a> TypeChecker<'a> {
                 resolution: self.resolution.clone(),
                 expr_types: self.expr_types,
                 target_types: self.target_types,
+                target_root_mutability: self.target_root_mutability,
                 records: self.records,
                 actions: self.actions,
                 externs: self.externs,
@@ -234,9 +238,33 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     value_type
                 };
-                scope.insert(name.clone(), declared_type);
+                scope.insert(name.clone(), declared_type, false);
             }
-            StmtKind::Set { target, value } => {
+            StmtKind::Var {
+                name,
+                explicit_type,
+                value,
+            } => {
+                let value_type = self.type_expr(value, scope, in_test)?;
+                let declared_type = if let Some(explicit_type) = explicit_type {
+                    let declared = self.lower_type_ref(explicit_type, &stmt.span)?;
+                    if !is_assignable(&declared, &value_type) {
+                        return Err(vec![type_error(
+                            &value.span,
+                            format!(
+                                "variable `{name}` expected type `{}`, found `{}`",
+                                declared.describe(),
+                                value_type.describe()
+                            ),
+                        )]);
+                    }
+                    declared
+                } else {
+                    value_type
+                };
+                scope.insert(name.clone(), declared_type, true);
+            }
+            StmtKind::Assign { target, value } => {
                 let target_type = self.type_target(target, scope, in_test)?;
                 let value_type = self.type_expr(value, scope, in_test)?;
                 if !is_assignable(&target_type, &value_type) {
@@ -322,7 +350,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 };
                 let mut body_scope = scope.clone();
-                body_scope.insert(binding.clone(), item_type);
+                body_scope.insert(binding.clone(), item_type, false);
                 self.type_block(
                     body,
                     &mut body_scope,
@@ -656,21 +684,34 @@ impl<'a> TypeChecker<'a> {
         scope: &mut Scope,
         in_test: bool,
     ) -> Result<Type, Vec<Diagnostic>> {
-        let ty = match target {
+        let (ty, root_mutable) = match target {
             Target::Name { name, span } => {
                 if scope.contains(name) {
-                    Ok(scope.get(name).expect("checked above").clone())
+                    if !scope.is_mutable(name) {
+                        Err(vec![type_error(
+                            span,
+                            format!("cannot assign to immutable binding `{name}`"),
+                        )])
+                    } else {
+                        Ok((scope.get(name).expect("checked above").clone(), true))
+                    }
                 } else if self.constants.contains_key(name) {
                     Err(vec![type_error(
                         span,
                         format!("cannot assign to constant `{name}`"),
                     )])
                 } else {
-                    self.lookup_name(name, scope, span)
+                    match self.lookup_name(name, scope, span) {
+                        Ok(_) => Err(vec![type_error(
+                            span,
+                            format!("cannot assign to non-local symbol `{name}`"),
+                        )]),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
                 }
             }
             Target::Field { base, field, span } => {
-                let base_type = self.type_target(base, scope, in_test)?;
+                let (base_type, base_mutable) = self.type_target_with_root_mutability(base, scope, in_test)?;
                 match base_type {
                     Type::Record(record_name) => {
                         let record = self.records.get(&record_name).ok_or_else(|| {
@@ -685,6 +726,7 @@ impl<'a> TypeChecker<'a> {
                                 format!("record `{record_name}` has no field `{field}`"),
                             )]
                         })
+                        .map(|ty| (ty, base_mutable))
                     }
                     other => Err(vec![type_error(
                         span,
@@ -696,7 +738,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Target::Index { base, index, span } => {
-                let base_type = self.type_target(base, scope, in_test)?;
+                let (base_type, base_mutable) = self.type_target_with_root_mutability(base, scope, in_test)?;
                 let index_type = self.type_expr(index, scope, in_test)?;
                 match base_type {
                     Type::List(item) => {
@@ -709,7 +751,7 @@ impl<'a> TypeChecker<'a> {
                                 ),
                             )]);
                         }
-                        Ok(*item)
+                        Ok((*item, base_mutable))
                     }
                     Type::Map(key, value) => {
                         if !is_assignable(&key, &index_type) {
@@ -722,7 +764,7 @@ impl<'a> TypeChecker<'a> {
                                 ),
                             )]);
                         }
-                        Ok(*value)
+                        Ok((*value, base_mutable))
                     }
                     other => Err(vec![type_error(
                         span,
@@ -735,7 +777,24 @@ impl<'a> TypeChecker<'a> {
             }
         }?;
         self.target_types.insert(target.span().clone(), ty.clone());
+        self.target_root_mutability
+            .insert(target.span().clone(), root_mutable);
         Ok(ty)
+    }
+
+    fn type_target_with_root_mutability(
+        &mut self,
+        target: &Target,
+        scope: &mut Scope,
+        in_test: bool,
+    ) -> Result<(Type, bool), Vec<Diagnostic>> {
+        let ty = self.type_target(target, scope, in_test)?;
+        let root_mutable = self
+            .target_root_mutability
+            .get(target.span())
+            .copied()
+            .unwrap_or(false);
+        Ok((ty, root_mutable))
     }
 
     fn lookup_name(
@@ -841,20 +900,33 @@ impl<'a> TypeChecker<'a> {
 
 #[derive(Debug, Clone, Default)]
 struct Scope {
-    bindings: HashMap<String, Type>,
+    bindings: HashMap<String, BindingInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct BindingInfo {
+    ty: Type,
+    mutable: bool,
 }
 
 impl Scope {
-    fn insert(&mut self, name: String, ty: Type) {
-        self.bindings.insert(name, ty);
+    fn insert(&mut self, name: String, ty: Type, mutable: bool) {
+        self.bindings.insert(name, BindingInfo { ty, mutable });
     }
 
     fn get(&self, name: &str) -> Option<&Type> {
-        self.bindings.get(name)
+        self.bindings.get(name).map(|binding| &binding.ty)
     }
 
     fn contains(&self, name: &str) -> bool {
         self.bindings.contains_key(name)
+    }
+
+    fn is_mutable(&self, name: &str) -> bool {
+        self.bindings
+            .get(name)
+            .map(|binding| binding.mutable)
+            .unwrap_or(false)
     }
 }
 
@@ -1043,12 +1115,87 @@ action main() -> Int:
         let diagnostics = check(
             r#"
 action main() -> None:
-  let count = 1
-  set count.value = 2
+  var count = 1
+  count.value := 2
   return
 "#,
         )
         .expect_err("check should fail");
         assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+    }
+
+    #[test]
+    fn rejects_assignment_to_immutable_let() {
+        let diagnostics = check(
+            r#"
+action main() -> Int:
+  let count = 1
+  count := 2
+  return count
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("cannot assign to immutable binding `count`")
+        );
+    }
+
+    #[test]
+    fn rejects_field_write_through_immutable_let() {
+        let diagnostics = check(
+            r#"
+record Customer:
+  email: Text
+
+action main() -> Text:
+  let customer = Customer(email: "before")
+  customer.email := "after"
+  return customer.email
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("cannot assign to immutable binding `customer`")
+        );
+    }
+
+    #[test]
+    fn rejects_assignment_to_action_parameter() {
+        let diagnostics = check(
+            r#"
+action main(count: Int) -> Int:
+  count := count + 1
+  return count
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("cannot assign to immutable binding `count`")
+        );
+    }
+
+    #[test]
+    fn allows_copying_parameter_into_var_before_mutation() {
+        check(
+            r#"
+record Customer:
+  email: Text
+
+action main(customer: Customer) -> Text:
+  var current = customer
+  current.email := "after"
+  return customer.email
+"#,
+        )
+        .expect("check should succeed");
     }
 }

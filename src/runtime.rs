@@ -216,7 +216,12 @@ impl<'a> Interpreter<'a> {
                 env.insert(name.clone(), evaluated);
                 Ok(ExecFlow::Continue)
             }
-            TypedStmtKind::Set { target, value } => {
+            TypedStmtKind::Var { name, value, .. } => {
+                let evaluated = self.eval_expr(value, env)?;
+                env.insert(name.clone(), evaluated);
+                Ok(ExecFlow::Continue)
+            }
+            TypedStmtKind::Assign { target, value } => {
                 let new_value = self.eval_expr(value, env)?;
                 self.assign_target(target, new_value, env)?;
                 Ok(ExecFlow::Continue)
@@ -423,7 +428,7 @@ impl<'a> Interpreter<'a> {
         span: &SourceSpan,
     ) -> Result<Value, Vec<Diagnostic>> {
         if let Some(value) = env.get(&symbol.name) {
-            return Ok(value.clone());
+            return Ok(value.snapshot());
         }
         if self.actions.contains_key(symbol.name.as_str()) {
             return Ok(Value::Callable(symbol.name.clone()));
@@ -525,7 +530,12 @@ impl<'a> Interpreter<'a> {
         env: &mut HashMap<String, Value>,
     ) -> Result<Value, Vec<Diagnostic>> {
         match target {
-            TypedTarget::Name { symbol, span, .. } => self.resolve_symbol(symbol, env, span),
+            TypedTarget::Name { symbol, span, .. } => env.get(&symbol.name).cloned().ok_or_else(|| {
+                vec![runtime_error(
+                    span,
+                    format!("unknown runtime symbol `{}`", symbol.name),
+                )]
+            }),
             TypedTarget::Field {
                 base, field, span, ..
             } => match self.read_target(base, env)? {
@@ -695,6 +705,34 @@ fn runtime_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
 }
 
 impl Value {
+    fn snapshot(&self) -> Self {
+        match self {
+            Value::Bool(value) => Value::Bool(*value),
+            Value::Int(value) => Value::Int(*value),
+            Value::Dec(value) => Value::Dec(value.clone()),
+            Value::Text(value) => Value::Text(value.clone()),
+            Value::None => Value::None,
+            Value::Record(fields) => Value::Record(Rc::new(RefCell::new(
+                fields
+                    .borrow()
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.snapshot()))
+                    .collect(),
+            ))),
+            Value::List(items) => Value::List(Rc::new(RefCell::new(
+                items.borrow().iter().map(Value::snapshot).collect(),
+            ))),
+            Value::Map(entries) => Value::Map(Rc::new(RefCell::new(
+                entries
+                    .borrow()
+                    .iter()
+                    .map(|(key, value)| (key.snapshot(), value.snapshot()))
+                    .collect(),
+            ))),
+            Value::Callable(name) => Value::Callable(name.clone()),
+        }
+    }
+
     fn as_bool(&self, span: &SourceSpan) -> Result<bool, Vec<Diagnostic>> {
         match self {
             Value::Bool(value) => Ok(*value),
@@ -744,11 +782,11 @@ mod tests {
         let module = lower(
             r#"
 action main() -> Int:
-  let x = 4
-  let y = 2
+  var x = 4
+  var y = 2
   while y > 0:
-    set x = x + 1
-    set y = y - 1
+    x := x + 1
+    y := y - 1
   return x
 "#,
         );
@@ -765,14 +803,33 @@ record Customer:
   email: Text
 
 action main() -> Text:
-  let customer = Customer(email: "before")
-  set customer.email = "after"
+  var customer = Customer(email: "before")
+  customer.email := "after"
   return customer.email
 "#,
         );
         let interpreter = Interpreter::new(&module).expect("interpreter");
         let result = interpreter.run_main().expect("run");
         assert_eq!(result.value, Value::Text("after".to_string()));
+    }
+
+    #[test]
+    fn preserves_let_immutability_across_var_copies() {
+        let module = lower(
+            r#"
+record Customer:
+  email: Text
+
+action main() -> Text:
+  let frozen = Customer(email: "before")
+  var current = frozen
+  current.email := "after"
+  return frozen.email
+"#,
+        );
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        assert_eq!(result.value, Value::Text("before".to_string()));
     }
 
     #[test]

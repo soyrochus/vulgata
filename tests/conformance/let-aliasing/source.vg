@@ -1,0 +1,8 @@
+record Customer:
+  email: Text
+
+action main() -> Text:
+  let frozen = Customer(email: "before")
+  var current = frozen
+  current.email := "after"
+  return frozen.email

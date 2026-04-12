@@ -13,6 +13,10 @@ record SortRun:
   before: List[Int]
   after: List[Int]
 
+record PartitionResult:
+  items: List[Int]
+  pivot: Int
+
 record SortShowcase:
   bubble: SortRun
   quick: SortRun
@@ -28,100 +32,100 @@ action with_duplicates() -> List[Int]:
 action reverse_data() -> List[Int]:
   return [9, 7, 5, 3, 1]
 
-action swap(items: List[Int], left: Int, right: Int) -> None:
-  let saved = items[left]
-  set items[left] = items[right]
-  set items[right] = saved
-  return
+action swap(items: List[Int], left: Int, right: Int) -> List[Int]:
+  var current = items
+  let saved = current[left]
+  current[left] := current[right]
+  current[right] := saved
+  return current
 
 action bubble_sort(items: List[Int], size: Int) -> List[Int]:
-  let end = size - 1
+  var current = items
+  var end = size - 1
   while end > 0:
-    let i = 0
+    var i = 0
     while i < end:
-      if items[i] > items[i + 1]:
-        swap(items, i, i + 1)
-      set i = i + 1
-    set end = end - 1
-  return items
+      if current[i] > current[i + 1]:
+        current := swap(current, i, i + 1)
+      i := i + 1
+    end := end - 1
+  return current
 
-action partition(items: List[Int], low: Int, high: Int) -> Int:
-  let pivot = items[high]
-  let store = low
-  let scan = low
+action partition(items: List[Int], low: Int, high: Int) -> PartitionResult:
+  var current = items
+  let pivot = current[high]
+  var store = low
+  var scan = low
   while scan < high:
-    if items[scan] <= pivot:
-      swap(items, store, scan)
-      set store = store + 1
-    set scan = scan + 1
-  swap(items, store, high)
-  return store
+    if current[scan] <= pivot:
+      current := swap(current, store, scan)
+      store := store + 1
+    scan := scan + 1
+  current := swap(current, store, high)
+  return PartitionResult(items: current, pivot: store)
 
-action quick_sort_range(items: List[Int], low: Int, high: Int) -> None:
+action quick_sort_range(items: List[Int], low: Int, high: Int) -> List[Int]:
+  var current = items
   if low < high:
-    let pivot_index = partition(items, low, high)
-    quick_sort_range(items, low, pivot_index - 1)
-    quick_sort_range(items, pivot_index + 1, high)
-  return
+    let step = partition(current, low, high)
+    current := quick_sort_range(step.items, low, step.pivot - 1)
+    current := quick_sort_range(current, step.pivot + 1, high)
+  return current
 
 action quick_sort(items: List[Int], size: Int) -> List[Int]:
   if size > 0:
-    quick_sort_range(items, 0, size - 1)
+    return quick_sort_range(items, 0, size - 1)
   return items
 
 action insertion_sort(items: List[Int], size: Int) -> List[Int]:
-  let i = 1
+  var current = items
+  var i = 1
   while i < size:
-    let j = i
+    var j = i
     while j > 0:
-      if items[j - 1] > items[j]:
-        swap(items, j - 1, j)
-        set j = j - 1
+      if current[j - 1] > current[j]:
+        current := swap(current, j - 1, j)
+        j := j - 1
       else:
         break
-    set i = i + 1
-  return items
+    i := i + 1
+  return current
 
 action selection_sort(items: List[Int], size: Int) -> List[Int]:
-  let start = 0
+  var current = items
+  var start = 0
   while start < size - 1:
-    let best = start
-    let scan = start + 1
+    var best = start
+    var scan = start + 1
     while scan < size:
-      if items[scan] < items[best]:
-        set best = scan
-      set scan = scan + 1
+      if current[scan] < current[best]:
+        best := scan
+      scan := scan + 1
     if best != start:
-      swap(items, start, best)
-    set start = start + 1
-  return items
+      current := swap(current, start, best)
+    start := start + 1
+  return current
 
 action make_sort_run(name: Text, before: List[Int], after: List[Int]) -> SortRun:
   return SortRun(name: name, before: before, after: after)
 
 action main() -> SortShowcase:
   let bubble_before = sample_data()
-  let bubble_items = sample_data()
+  let bubble_items = bubble_sort(sample_data(), 5)
 
   let quick_before = with_duplicates()
-  let quick_items = with_duplicates()
+  let quick_items = quick_sort(with_duplicates(), 5)
 
   let insertion_before = reverse_data()
-  let insertion_items = reverse_data()
+  let insertion_items = insertion_sort(reverse_data(), 5)
 
   let selection_before = sample_data()
-  let selection_items = sample_data()
-
-  bubble_sort(bubble_items, 5)
-  quick_sort(quick_items, 5)
-  insertion_sort(insertion_items, 5)
-  selection_sort(selection_items, 5)
+  let selection_items = selection_sort(sample_data(), 5)
 
   return SortShowcase(bubble: make_sort_run("bubble sort", bubble_before, bubble_items), quick: make_sort_run("quick sort", quick_before, quick_items), insertion: make_sort_run("insertion sort", insertion_before, insertion_items), selection: make_sort_run("selection sort", selection_before, selection_items))
 
 test bubble_sort_orders_sample_data:
-  let items = sample_data()
-  bubble_sort(items, 5)
+  let items = bubble_sort(sample_data(), 5)
   expect items[0] == 1
   expect items[1] == 2
   expect items[2] == 5
@@ -129,8 +133,7 @@ test bubble_sort_orders_sample_data:
   expect items[4] == 9
 
 test quick_sort_handles_duplicates:
-  let items = with_duplicates()
-  quick_sort(items, 5)
+  let items = quick_sort(with_duplicates(), 5)
   expect items[0] == 1
   expect items[1] == 2
   expect items[2] == 3
@@ -138,8 +141,7 @@ test quick_sort_handles_duplicates:
   expect items[4] == 4
 
 test insertion_sort_handles_reverse_input:
-  let items = reverse_data()
-  insertion_sort(items, 5)
+  let items = insertion_sort(reverse_data(), 5)
   expect items[0] == 1
   expect items[1] == 3
   expect items[2] == 5
@@ -147,10 +149,8 @@ test insertion_sort_handles_reverse_input:
   expect items[4] == 9
 
 test selection_sort_matches_bubble_sort:
-  let left = sample_data()
-  let right = sample_data()
-  selection_sort(left, 5)
-  bubble_sort(right, 5)
+  let left = selection_sort(sample_data(), 5)
+  let right = bubble_sort(sample_data(), 5)
   expect left[0] == right[0]
   expect left[1] == right[1]
   expect left[2] == right[2]

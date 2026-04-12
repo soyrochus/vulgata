@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
@@ -158,7 +160,7 @@ pub fn lower_module(module: &TypedIrModule) -> Result<RustModule, Vec<Diagnostic
                             Ok(RustParam {
                                 name: name.clone(),
                                 ty: lower_storage_type(ty, &action.span)?,
-                                mutable: true,
+                                mutable: false,
                             })
                         })
                         .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
@@ -204,9 +206,10 @@ pub fn emit_module(module: &RustModule) -> String {
 fn lower_action_body(
     action: &crate::tir::TypedActionDecl,
 ) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
+    let reassigned = collect_direct_name_assignments(&action.body);
     let mut body = Vec::new();
     for stmt in &action.body {
-        body.push(lower_stmt(stmt, false)?);
+        body.push(lower_stmt(stmt, false, &reassigned)?);
     }
 
     if block_may_fall_through(&body) && *action.ty.action_result() == Type::None {
@@ -223,6 +226,7 @@ fn lower_action_body(
 fn lower_test_body(
     test_decl: &crate::tir::TypedTestDecl,
 ) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
+    let reassigned = collect_direct_name_assignments(&test_decl.body);
     let mut body = vec![RustStmt::Let {
         name: "failures".to_string(),
         ty: Some(RustType::Path("Vec<String>".to_string())),
@@ -230,28 +234,38 @@ fn lower_test_body(
         mutable: true,
     }];
     for stmt in &test_decl.body {
-        body.push(lower_stmt(stmt, true)?);
+        body.push(lower_stmt(stmt, true, &reassigned)?);
     }
     body.push(RustStmt::Return(Some(RustExpr::raw("failures"))));
     Ok(body)
 }
 
-fn lower_stmt(stmt: &TypedStmt, in_test: bool) -> Result<RustStmt, Vec<Diagnostic>> {
+fn lower_stmt(
+    stmt: &TypedStmt,
+    in_test: bool,
+    reassigned: &HashSet<String>,
+) -> Result<RustStmt, Vec<Diagnostic>> {
     let lowered = match &stmt.kind {
         TypedStmtKind::Let { name, ty, value } => RustStmt::Let {
             name: name.clone(),
             ty: Some(lower_storage_type(ty, &stmt.span)?),
             value: lower_expr(value)?,
-            mutable: true,
+            mutable: false,
         },
-        TypedStmtKind::Set { target, value } => lower_assignment(target, value)?,
+        TypedStmtKind::Var { name, ty, value } => RustStmt::Let {
+            name: name.clone(),
+            ty: Some(lower_storage_type(ty, &stmt.span)?),
+            value: lower_expr(value)?,
+            mutable: reassigned.contains(name),
+        },
+        TypedStmtKind::Assign { target, value } => lower_assignment(target, value)?,
         TypedStmtKind::If {
             branches,
             else_branch,
-        } => lower_if(branches, else_branch, in_test)?,
+        } => lower_if(branches, else_branch, in_test, reassigned)?,
         TypedStmtKind::While { condition, body } => RustStmt::While {
             condition: lower_expr(condition)?,
-            body: lower_block(body, in_test)?,
+            body: lower_block(body, in_test, reassigned)?,
         },
         TypedStmtKind::ForEach {
             binding,
@@ -260,7 +274,7 @@ fn lower_stmt(stmt: &TypedStmt, in_test: bool) -> Result<RustStmt, Vec<Diagnosti
         } => RustStmt::ForEach {
             binding: binding.clone(),
             iterable: lower_expr(iterable)?,
-            body: lower_block(body, in_test)?,
+            body: lower_block(body, in_test, reassigned)?,
         },
         TypedStmtKind::Return(expr) => RustStmt::Return(expr.as_ref().map(lower_expr).transpose()?),
         TypedStmtKind::Break => RustStmt::Break,
@@ -286,14 +300,21 @@ fn lower_stmt(stmt: &TypedStmt, in_test: bool) -> Result<RustStmt, Vec<Diagnosti
     Ok(lowered)
 }
 
-fn lower_block(block: &[TypedStmt], in_test: bool) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
-    block.iter().map(|stmt| lower_stmt(stmt, in_test)).collect()
+fn lower_block(
+    block: &[TypedStmt],
+    in_test: bool,
+    reassigned: &HashSet<String>,
+) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
+    block.iter()
+        .map(|stmt| lower_stmt(stmt, in_test, reassigned))
+        .collect()
 }
 
 fn lower_if(
     branches: &[(TypedExpr, Vec<TypedStmt>)],
     else_branch: &[TypedStmt],
     in_test: bool,
+    reassigned: &HashSet<String>,
 ) -> Result<RustStmt, Vec<Diagnostic>> {
     if branches.is_empty() {
         return Ok(RustStmt::Raw("{}".to_string()));
@@ -302,19 +323,58 @@ fn lower_if(
     let (condition, body) = &branches[0];
     let mut statement = RustStmt::If {
         condition: lower_expr(condition)?,
-        then_body: lower_block(body, in_test)?,
-        else_body: lower_block(else_branch, in_test)?,
+        then_body: lower_block(body, in_test, reassigned)?,
+        else_body: lower_block(else_branch, in_test, reassigned)?,
     };
 
     for (condition, body) in branches.iter().skip(1).rev() {
         statement = RustStmt::If {
             condition: lower_expr(condition)?,
-            then_body: lower_block(body, in_test)?,
+            then_body: lower_block(body, in_test, reassigned)?,
             else_body: vec![statement],
         };
     }
 
     Ok(statement)
+}
+
+fn collect_direct_name_assignments(block: &[TypedStmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_direct_name_assignments_into(block, &mut names);
+    names
+}
+
+fn collect_direct_name_assignments_into(block: &[TypedStmt], names: &mut HashSet<String>) {
+    for stmt in block {
+        match &stmt.kind {
+            TypedStmtKind::Assign {
+                target: TypedTarget::Name { symbol, .. },
+                ..
+            } => {
+                names.insert(symbol.name.clone());
+            }
+            TypedStmtKind::If {
+                branches,
+                else_branch,
+            } => {
+                for (_, body) in branches {
+                    collect_direct_name_assignments_into(body, names);
+                }
+                collect_direct_name_assignments_into(else_branch, names);
+            }
+            TypedStmtKind::While { body, .. } | TypedStmtKind::ForEach { body, .. } => {
+                collect_direct_name_assignments_into(body, names);
+            }
+            TypedStmtKind::Let { .. }
+            | TypedStmtKind::Var { .. }
+            | TypedStmtKind::Assign { .. }
+            | TypedStmtKind::Return(_)
+            | TypedStmtKind::Break
+            | TypedStmtKind::Continue
+            | TypedStmtKind::Expect(_)
+            | TypedStmtKind::Expr(_) => {}
+        }
+    }
 }
 
 fn lower_assignment(target: &TypedTarget, value: &TypedExpr) -> Result<RustStmt, Vec<Diagnostic>> {
@@ -378,10 +438,9 @@ fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
         TypedExprKind::FieldAccess { base, field } => {
             let base_expr = lower_expr(base)?;
             match &base.ty {
-                Type::Record(_) => Ok(RustExpr::raw(format!(
-                    "{}.borrow().{}.clone()",
-                    render_expr(&base_expr),
-                    field
+                Type::Record(_) => Ok(RustExpr::raw(snapshot_expr(
+                    &format!("{}.borrow().{}", render_expr(&base_expr), field),
+                    &expr.ty,
                 ))),
                 other => Err(vec![codegen_error(
                     &expr.span,
@@ -490,7 +549,7 @@ fn lower_literal(literal: &TypedLiteral) -> RustExpr {
 
 fn lower_symbol(
     symbol: &TypedSymbol,
-    _ty: &Type,
+    ty: &Type,
     span: &SourceSpan,
 ) -> Result<RustExpr, Vec<Diagnostic>> {
     match symbol.kind {
@@ -502,7 +561,7 @@ fn lower_symbol(
                 symbol.name
             ),
         )]),
-        _ => Ok(RustExpr::raw(format!("{}.clone()", symbol.name))),
+        _ => Ok(RustExpr::raw(snapshot_expr(&symbol.name, ty))),
     }
 }
 
@@ -735,6 +794,19 @@ fn render_item(item: &RustItem, indent: usize, output: &mut String) {
                 );
             }
             line(indent, "}", output);
+            line(indent, &format!("impl support::Snapshot for {name} {{"), output);
+            line(indent + 1, "fn snapshot(&self) -> Self {", output);
+            line(indent + 2, &format!("{name} {{"), output);
+            for (field, _) in fields {
+                line(
+                    indent + 3,
+                    &format!("{field}: support::snapshot(&self.{field}),"),
+                    output,
+                );
+            }
+            line(indent + 2, "}", output);
+            line(indent + 1, "}", output);
+            line(indent, "}", output);
         }
         RustItem::Enum { name, variants } => {
             line(indent, "#[derive(Clone, Debug, PartialEq)]", output);
@@ -742,6 +814,11 @@ fn render_item(item: &RustItem, indent: usize, output: &mut String) {
             for variant in variants {
                 line(indent + 1, &format!("{variant},"), output);
             }
+            line(indent, "}", output);
+            line(indent, &format!("impl support::Snapshot for {name} {{"), output);
+            line(indent + 1, "fn snapshot(&self) -> Self {", output);
+            line(indent + 2, "self.clone()", output);
+            line(indent + 1, "}", output);
             line(indent, "}", output);
         }
         RustItem::Function {
@@ -926,6 +1003,13 @@ fn render_type(ty: &RustType) -> String {
     }
 }
 
+fn snapshot_expr(expr: &str, ty: &Type) -> String {
+    match ty {
+        Type::Action(_) | Type::ExternAction(_) | Type::Unknown => expr.to_string(),
+        _ => format!("support::snapshot(&{expr})"),
+    }
+}
+
 fn binary_op(op: &BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -994,21 +1078,115 @@ const SUPPORT_MODULE: &str = r#"mod support {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    pub trait Snapshot {
+        fn snapshot(&self) -> Self;
+    }
+
+    pub fn snapshot<T: Snapshot>(value: &T) -> T {
+        value.snapshot()
+    }
+
+    impl Snapshot for bool {
+        fn snapshot(&self) -> Self {
+            *self
+        }
+    }
+
+    impl Snapshot for i64 {
+        fn snapshot(&self) -> Self {
+            *self
+        }
+    }
+
+    impl Snapshot for f64 {
+        fn snapshot(&self) -> Self {
+            *self
+        }
+    }
+
+    impl Snapshot for String {
+        fn snapshot(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    impl Snapshot for () {
+        fn snapshot(&self) -> Self {
+            *self
+        }
+    }
+
+    impl<T: Snapshot> Snapshot for Vec<T> {
+        fn snapshot(&self) -> Self {
+            self.iter().map(Snapshot::snapshot).collect()
+        }
+    }
+
+    impl<T: Snapshot> Snapshot for Option<T> {
+        fn snapshot(&self) -> Self {
+            self.as_ref().map(Snapshot::snapshot)
+        }
+    }
+
+    impl<T: Snapshot, E: Snapshot> Snapshot for Result<T, E> {
+        fn snapshot(&self) -> Self {
+            match self {
+                Ok(value) => Ok(value.snapshot()),
+                Err(error) => Err(error.snapshot()),
+            }
+        }
+    }
+
+    impl<A: Snapshot> Snapshot for (A,) {
+        fn snapshot(&self) -> Self {
+            (self.0.snapshot(),)
+        }
+    }
+
+    impl<A: Snapshot, B: Snapshot> Snapshot for (A, B) {
+        fn snapshot(&self) -> Self {
+            (self.0.snapshot(), self.1.snapshot())
+        }
+    }
+
+    impl<A: Snapshot, B: Snapshot, C: Snapshot> Snapshot for (A, B, C) {
+        fn snapshot(&self) -> Self {
+            (self.0.snapshot(), self.1.snapshot(), self.2.snapshot())
+        }
+    }
+
+    impl<A: Snapshot, B: Snapshot, C: Snapshot, D: Snapshot> Snapshot for (A, B, C, D) {
+        fn snapshot(&self) -> Self {
+            (
+                self.0.snapshot(),
+                self.1.snapshot(),
+                self.2.snapshot(),
+                self.3.snapshot(),
+            )
+        }
+    }
+
+    impl<T: Snapshot> Snapshot for Rc<RefCell<T>> {
+        fn snapshot(&self) -> Self {
+            Rc::new(RefCell::new(self.borrow().snapshot()))
+        }
+    }
+
     pub fn text_add(left: String, right: String) -> String {
         let mut joined = left;
         joined.push_str(&right);
         joined
     }
 
-    pub fn list_get<T: Clone>(items: &Rc<RefCell<Vec<T>>>, index: i64) -> T {
-        items.borrow()[index as usize].clone()
+    pub fn list_get<T: Snapshot>(items: &Rc<RefCell<Vec<T>>>, index: i64) -> T {
+        items.borrow()[index as usize].snapshot()
     }
 
     pub fn list_set<T>(items: &Rc<RefCell<Vec<T>>>, index: i64, value: T) {
         items.borrow_mut()[index as usize] = value;
     }
 
-    pub fn map_get<K: Clone + PartialEq, V: Clone>(
+    pub fn map_get<K: PartialEq, V: Snapshot>(
         entries: &Rc<RefCell<Vec<(K, V)>>>,
         key: &K,
     ) -> V {
@@ -1016,7 +1194,7 @@ const SUPPORT_MODULE: &str = r#"mod support {
             .borrow()
             .iter()
             .find(|(existing_key, _)| existing_key == key)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value.snapshot())
             .expect("map key not found")
     }
 
@@ -1096,6 +1274,7 @@ impl TypedTargetExt for TypedTarget {
 mod tests {
     use std::path::Path;
     use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::lexer::Lexer;
     use crate::parser::Parser;
@@ -1104,6 +1283,17 @@ mod tests {
     use crate::types::TypeChecker;
 
     use super::{emit_module, lower_module};
+
+    fn unique_codegen_dir(label: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vulgata-codegen-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 
     fn lower(source: &str) -> crate::tir::TypedIrModule {
         let path = Path::new("test.vg");
@@ -1124,11 +1314,11 @@ record Customer:
   email: Text
 
 action main() -> Int:
-  let customer = Customer(email: "before")
-  let count = 2
+  var customer = Customer(email: "before")
+  var count = 2
   while count > 0:
-    set customer.email = "after"
-    set count = count - 1
+    customer.email := "after"
+    count := count - 1
   return count
 "#,
         );
@@ -1146,11 +1336,11 @@ action main() -> Int:
         let module = lower(
             r#"
 action main() -> Int:
-  let x = 4
-  let y = 2
+  var x = 4
+  var y = 2
   while y > 0:
-    set x = x + 1
-    set y = y - 1
+    x := x + 1
+    y := y - 1
   return x
 "#,
         );
@@ -1158,7 +1348,7 @@ action main() -> Int:
         let lowered = lower_module(&module).expect("codegen lower");
         let emitted = emit_module(&lowered);
 
-        let dir = std::env::temp_dir().join(format!("vulgata-codegen-{}", std::process::id()));
+        let dir = unique_codegen_dir("compile");
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source_path = dir.join("generated.rs");
         let binary_path = dir.join("generated-bin");
@@ -1172,5 +1362,45 @@ action main() -> Int:
             .status()
             .expect("run rustc");
         assert!(status.success(), "rustc failed with status {status:?}");
+    }
+
+    #[test]
+    fn emitted_rust_preserves_let_immutability_across_var_copies() {
+        let module = lower(
+            r#"
+record Customer:
+  email: Text
+
+action main() -> Text:
+  let frozen = Customer(email: "before")
+  var current = frozen
+  current.email := "after"
+  return frozen.email
+"#,
+        );
+
+        let lowered = lower_module(&module).expect("codegen lower");
+        let emitted = emit_module(&lowered);
+
+        let dir = unique_codegen_dir("aliasing");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source_path = dir.join("generated.rs");
+        let binary_path = dir.join("generated-bin");
+        std::fs::write(&source_path, emitted).expect("write generated source");
+
+        let status = Command::new("rustc")
+            .arg("--edition=2024")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .status()
+            .expect("run rustc");
+        assert!(status.success(), "rustc failed with status {status:?}");
+
+        let output = Command::new(&binary_path)
+            .output()
+            .expect("run generated binary");
+        assert!(output.status.success(), "binary failed with status {:?}", output.status);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Text(\"before\")");
     }
 }
