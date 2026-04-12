@@ -175,6 +175,7 @@ It follows these rules:
 * `:=` updates previously introduced mutable REPL bindings according to the same mutability rules used inside actions
 * `:run` and `:test` rebuild a fresh interpreter from the current session source
 * session state includes both source-persistent declarations and REPL-local bindings
+* when running in a reasonably modern terminal, the CLI REPL should provide basic line editing, cursor motion, and command history
 
 Core REPL commands:
 

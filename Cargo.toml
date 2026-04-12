@@ -5,3 +5,4 @@ edition = "2024"
 description = "Vulgata is a compact, human-readable, executable language designed as a lingua franca for humans and AI systems collaborating on software design, algorithm specification, workflow definition, and lightweight application logic"
 
 [dependencies]
+rustyline = "14"

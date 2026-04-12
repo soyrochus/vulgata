@@ -38,7 +38,6 @@ The initial REPL does not aim to provide:
 * a dynamic interpreter mode with semantics different from ordinary Vulgata modules
 * ad hoc runtime mutation that bypasses parsing, type checking, or typed IR lowering
 * compile-mode execution inside the interactive loop
-* shell-like history editing beyond what the host terminal already provides
 * debugger-grade stepping, breakpoints, or variable inspection in the first version
 
 ---
@@ -176,6 +175,14 @@ The MVP should treat a submitted block as complete when the user terminates entr
 * using a terminal line editor that submits a buffered block
 
 The exact input UX may vary, but block completion must be explicit and predictable.
+
+In a reasonably modern terminal, the CLI REPL should provide basic line editing behavior:
+
+* left/right cursor movement within the current line
+* history navigation for previous inputs
+* ordinary character insertion and deletion
+
+The specification does not require custom terminal emulation logic beyond that baseline.
 
 ## 7.3 Successful append semantics
 

@@ -88,13 +88,7 @@ fn dispatch(args: Vec<String>) -> Result<(), Vec<Diagnostic>> {
             println!("{}", output_path.display());
             Ok(())
         }
-        "repl" => {
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            let mut input = stdin.lock();
-            let mut output = stdout.lock();
-            crate::repl::run_repl(&mut input, &mut output)
-        }
+        "repl" => crate::repl::run_repl_terminal(),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())

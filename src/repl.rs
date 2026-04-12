@@ -1,3 +1,5 @@
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -225,6 +227,83 @@ pub fn run_repl<R: BufRead, W: Write>(
     Ok(())
 }
 
+pub fn run_repl_terminal() -> Result<(), Vec<Diagnostic>> {
+    let mut editor = DefaultEditor::new().map_err(readline_init_diag)?;
+    println!("vulgata repl");
+    println!("type :help for commands");
+
+    let mut session = ReplSession::new();
+    let mut pending = Vec::new();
+
+    loop {
+        let prompt = if pending.is_empty() { "> " } else { "| " };
+        match editor.readline(prompt) {
+            Ok(line) => {
+                if !line.is_empty() {
+                    let _ = editor.add_history_entry(line.as_str());
+                }
+
+                let trimmed = line.trim_end();
+                if pending.is_empty() && trimmed.starts_with(':') {
+                    match session.handle_command(trimmed)? {
+                        ReplCommand::Continue(lines) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
+                        }
+                        ReplCommand::Quit(lines) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                if trimmed.is_empty() {
+                    if pending.is_empty() {
+                        continue;
+                    }
+
+                    let block = pending.join("\n");
+                    match session.submit_input(&block) {
+                        Ok(lines) => {
+                            for line in lines {
+                                println!("{line}");
+                            }
+                        }
+                        Err(diagnostics) => {
+                            for diagnostic in diagnostics {
+                                println!("{diagnostic}");
+                            }
+                        }
+                    }
+                    pending.clear();
+                    continue;
+                }
+
+                pending.push(trimmed.to_string());
+            }
+            Err(ReadlineError::Interrupted) => {
+                if pending.is_empty() {
+                    println!("^C");
+                    break;
+                }
+                pending.clear();
+                println!("input cleared");
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(error) => return Err(vec![readline_runtime_diag(error)]),
+        }
+    }
+
+    Ok(())
+}
+
 fn format_test_results(results: &[TestResult]) -> Vec<String> {
     let mut lines = Vec::new();
     for result in results {
@@ -267,6 +346,18 @@ fn io_diag(error: std::io::Error) -> Vec<Diagnostic> {
         Phase::Cli,
         format!("repl I/O error: {error}"),
     )]
+}
+
+fn readline_init_diag(error: ReadlineError) -> Vec<Diagnostic> {
+    vec![readline_runtime_diag(error)]
+}
+
+fn readline_runtime_diag(error: ReadlineError) -> Diagnostic {
+    Diagnostic::new(
+        SourceSpan::new("<repl>", 1, 1),
+        Phase::Cli,
+        format!("repl terminal error: {error}"),
+    )
 }
 
 #[cfg(test)]

@@ -7,6 +7,8 @@
 [![FOSS Pluralism](https://img.shields.io/badge/FOSS-Pluralism-purple.svg)](FOSS_PLURALISM_MANIFESTO.md)
 [![OpenSpec](https://img.shields.io/badge/OpenSpec-Used-black.svg)](https://openspec.dev/)
 
+![Vulgata logo](./images/vulgata-logo-small.png)
+
 ## 1. Purpose
 
 Vulgata is a compact, human-readable, executable language designed as a lingua franca for humans and AI systems collaborating on software design, algorithm specification, workflow definition, and lightweight application logic.
@@ -205,7 +207,7 @@ Vulgata also provides a small interactive REPL:
 vulgata repl
 ```
 
-The REPL keeps an in-memory virtual source file for declarations and also maintains session-local `let`/`var` bindings. Submit a declaration block with a trailing empty line to extend the session source, submit an expression block to evaluate it against the current session, or submit `let`/`var`/`:=` statements to work with REPL-local bindings. Commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit` remain available.
+The REPL keeps an in-memory virtual source file for declarations and also maintains session-local `let`/`var` bindings. Submit a declaration block with a trailing empty line to extend the session source, submit an expression block to evaluate it against the current session, or submit `let`/`var`/`:=` statements to work with REPL-local bindings. In a modern terminal the CLI REPL now provides basic line editing, cursor movement, and input history. Commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit` remain available.
 
 Example session:
 
