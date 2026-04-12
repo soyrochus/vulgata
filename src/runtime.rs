@@ -1,12 +1,15 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::externs::ExternRegistry;
 use crate::resolver::SymbolKind;
+use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
     TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
     TypedStmtKind, TypedSymbol, TypedTarget,
@@ -19,6 +22,8 @@ pub enum Value {
     Dec(String),
     Text(String),
     None,
+    ResultOk(Box<Value>),
+    ResultErr(Box<Value>),
     Record(Rc<RefCell<BTreeMap<String, Value>>>),
     List(Rc<RefCell<Vec<Value>>>),
     Map(Rc<RefCell<Vec<(Value, Value)>>>),
@@ -33,6 +38,8 @@ impl fmt::Debug for Value {
             Value::Dec(value) => write!(f, "Dec({value})"),
             Value::Text(value) => write!(f, "Text({value:?})"),
             Value::None => write!(f, "None"),
+            Value::ResultOk(value) => write!(f, "Ok({})", format_result_value(value)),
+            Value::ResultErr(value) => write!(f, "Err({})", format_result_value(value)),
             Value::Record(fields) => f.debug_tuple("Record").field(&fields.borrow()).finish(),
             Value::List(items) => f.debug_tuple("List").field(&items.borrow()).finish(),
             Value::Map(entries) => f.debug_tuple("Map").field(&entries.borrow()).finish(),
@@ -152,6 +159,9 @@ impl<'a> Interpreter<'a> {
     }
 
     fn call_action(&self, name: &str, args: Vec<Value>) -> Result<Value, Vec<Diagnostic>> {
+        if let Some(action) = standard_runtime::lookup_standard_runtime_name(name) {
+            return self.call_standard_runtime(action, args, &self.module.span);
+        }
         if self.externs.contains(name) {
             return self.externs.call(name, args, &self.module.span);
         }
@@ -433,6 +443,11 @@ impl<'a> Interpreter<'a> {
         if self.actions.contains_key(symbol.name.as_str()) {
             return Ok(Value::Callable(symbol.name.clone()));
         }
+        if symbol.kind == Some(SymbolKind::Runtime)
+            || standard_runtime::lookup_standard_runtime_name(&symbol.name).is_some()
+        {
+            return Ok(Value::Callable(symbol.name.clone()));
+        }
         if symbol.kind == Some(SymbolKind::Extern) || self.externs.contains(symbol.name.as_str()) {
             return Ok(Value::Callable(symbol.name.clone()));
         }
@@ -596,6 +611,65 @@ impl<'a> Interpreter<'a> {
             )]),
         }
     }
+
+    fn call_standard_runtime(
+        &self,
+        action: StandardRuntimeAction,
+        args: Vec<Value>,
+        span: &SourceSpan,
+    ) -> Result<Value, Vec<Diagnostic>> {
+        match action {
+            StandardRuntimeAction::ConsolePrint => {
+                let value = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                write_console(&value, false, false, span)
+            }
+            StandardRuntimeAction::ConsolePrintln => {
+                let value = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                write_console(&value, true, false, span)
+            }
+            StandardRuntimeAction::ConsoleEprint => {
+                let value = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                write_console(&value, false, true, span)
+            }
+            StandardRuntimeAction::ConsoleEprintln => {
+                let value = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                write_console(&value, true, true, span)
+            }
+            StandardRuntimeAction::ConsoleReadLine => read_console_line(span),
+            StandardRuntimeAction::FileReadText => {
+                let path = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                match fs::read_to_string(&path) {
+                    Ok(content) => Ok(Value::ok(Value::Text(content))),
+                    Err(error) => Ok(Value::err_text(error.to_string())),
+                }
+            }
+            StandardRuntimeAction::FileWriteText => {
+                let path = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                let content = expect_text_arg(&args, span, action.qualified_name(), 1)?;
+                match fs::write(&path, content) {
+                    Ok(()) => Ok(Value::ok(Value::None)),
+                    Err(error) => Ok(Value::err_text(error.to_string())),
+                }
+            }
+            StandardRuntimeAction::FileAppendText => {
+                let path = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                let content = expect_text_arg(&args, span, action.qualified_name(), 1)?;
+                match fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut file| file.write_all(content.as_bytes()))
+                {
+                    Ok(()) => Ok(Value::ok(Value::None)),
+                    Err(error) => Ok(Value::err_text(error.to_string())),
+                }
+            }
+            StandardRuntimeAction::FileExists => {
+                let path = expect_text_arg(&args, span, action.qualified_name(), 0)?;
+                Ok(Value::Bool(Path::new(&path).exists()))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -705,6 +779,18 @@ fn runtime_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
 }
 
 impl Value {
+    fn ok(value: Value) -> Self {
+        Self::ResultOk(Box::new(value))
+    }
+
+    fn err(value: Value) -> Self {
+        Self::ResultErr(Box::new(value))
+    }
+
+    fn err_text(message: impl Into<String>) -> Self {
+        Self::err(Value::Text(message.into()))
+    }
+
     fn snapshot(&self) -> Self {
         match self {
             Value::Bool(value) => Value::Bool(*value),
@@ -712,6 +798,8 @@ impl Value {
             Value::Dec(value) => Value::Dec(value.clone()),
             Value::Text(value) => Value::Text(value.clone()),
             Value::None => Value::None,
+            Value::ResultOk(value) => Value::ResultOk(Box::new(value.snapshot())),
+            Value::ResultErr(value) => Value::ResultErr(Box::new(value.snapshot())),
             Value::Record(fields) => Value::Record(Rc::new(RefCell::new(
                 fields
                     .borrow()
@@ -869,5 +957,132 @@ return = "Int"
         let interpreter = Interpreter::with_externs(&module, registry).expect("interpreter");
         let result = interpreter.run_main().expect("run");
         assert_eq!(result.value, Value::Int(7));
+    }
+
+    #[test]
+    fn supports_standard_runtime_console_calls() {
+        let module = lower(
+            r#"
+action main() -> Result[None, Text]:
+  return console.print("")
+"#,
+        );
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        assert_eq!(format!("{:?}", result.value), "Ok(())");
+    }
+
+    #[test]
+    fn supports_standard_runtime_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("vulgata-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("runtime-roundtrip.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Result[Text, Text]:
+  let _written = file.write_text("{path}", "hello")
+  return file.read_text("{path}")
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        assert_eq!(format!("{:?}", result.value), "Ok(\"hello\")");
+    }
+
+    #[test]
+    fn reports_standard_runtime_file_errors_explicitly() {
+        let dir = std::env::temp_dir().join(format!("vulgata-runtime-{}", std::process::id()));
+        let path = dir.join("missing-file.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Result[Text, Text]:
+  return file.read_text("{path}")
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        match result.value {
+            Value::ResultErr(inner) => match *inner {
+                Value::Text(message) => assert!(!message.is_empty()),
+                other => panic!("unexpected error payload: {other:?}"),
+            },
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+}
+
+fn format_result_value(value: &Value) -> String {
+    match value {
+        Value::Text(text) => format!("{text:?}"),
+        Value::None => "()".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn expect_text_arg(
+    args: &[Value],
+    span: &SourceSpan,
+    name: &str,
+    index: usize,
+) -> Result<String, Vec<Diagnostic>> {
+    let value = args.get(index).ok_or_else(|| {
+        vec![runtime_error(
+            span,
+            format!("runtime action `{name}` expected argument {}", index + 1),
+        )]
+    })?;
+    match value {
+        Value::Text(value) => Ok(value.clone()),
+        other => Err(vec![runtime_error(
+            span,
+            format!(
+                "runtime action `{name}` argument {} expected Text, found {other:?}",
+                index + 1
+            ),
+        )]),
+    }
+}
+
+fn write_console(
+    value: &str,
+    newline: bool,
+    stderr: bool,
+    _span: &SourceSpan,
+) -> Result<Value, Vec<Diagnostic>> {
+    let result = if stderr {
+        let mut handle = io::stderr();
+        if newline {
+            writeln!(handle, "{value}")
+        } else {
+            write!(handle, "{value}")
+        }
+    } else {
+        let mut handle = io::stdout();
+        if newline {
+            writeln!(handle, "{value}")
+        } else {
+            write!(handle, "{value}")
+        }
+    };
+
+    match result {
+        Ok(()) => Ok(Value::ok(Value::None)),
+        Err(error) => Ok(Value::err_text(error.to_string())),
+    }
+}
+
+fn read_console_line(_span: &SourceSpan) -> Result<Value, Vec<Diagnostic>> {
+    let mut line = String::new();
+    match io::stdin().read_line(&mut line) {
+        Ok(0) => Ok(Value::err_text("end of input")),
+        Ok(_) => {
+            while matches!(line.chars().last(), Some('\n' | '\r')) {
+                line.pop();
+            }
+            Ok(Value::ok(Value::Text(line)))
+        }
+        Err(error) => Ok(Value::err_text(error.to_string())),
     }
 }

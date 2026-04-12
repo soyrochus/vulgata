@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
+use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
     TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
     TypedStmtKind, TypedSymbol, TypedTarget,
@@ -554,7 +555,7 @@ fn lower_symbol(
 ) -> Result<RustExpr, Vec<Diagnostic>> {
     match symbol.kind {
         Some(SymbolKind::Const) => Ok(RustExpr::raw(format!("{}()", const_fn_name(&symbol.name)))),
-        Some(SymbolKind::Action) | Some(SymbolKind::Extern) => Err(vec![codegen_error(
+        Some(SymbolKind::Action) | Some(SymbolKind::Extern) | Some(SymbolKind::Runtime) => Err(vec![codegen_error(
             span,
             format!(
                 "first-class callable `{}` is not supported by compile mode yet",
@@ -571,6 +572,9 @@ fn lower_call(
     expr: &TypedExpr,
 ) -> Result<RustExpr, Vec<Diagnostic>> {
     if let TypedExprKind::Symbol(symbol) = &callee.kind {
+        if let Some(action) = lookup_standard_runtime_symbol(symbol) {
+            return lower_standard_runtime_call(action, args, &expr.span);
+        }
         match symbol.kind {
             Some(SymbolKind::Record) => {
                 let mut fields = Vec::new();
@@ -619,6 +623,70 @@ fn lower_call(
         &expr.span,
         "compile only supports direct calls to records and actions",
     )])
+}
+
+fn lower_standard_runtime_call(
+    action: StandardRuntimeAction,
+    args: &[TypedCallArg],
+    span: &SourceSpan,
+) -> Result<RustExpr, Vec<Diagnostic>> {
+    let rendered_args = args
+        .iter()
+        .map(|arg| {
+            if arg.name.is_some() {
+                return Err(vec![codegen_error(
+                    &arg.expr.span,
+                    "standard runtime calls do not support named arguments",
+                )]);
+            }
+            Ok(render_expr(&lower_expr(&arg.expr)?))
+        })
+        .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?;
+
+    let expr = match action {
+        StandardRuntimeAction::ConsolePrint => {
+            format!("support::console_print({}, false, false)", rendered_args[0])
+        }
+        StandardRuntimeAction::ConsolePrintln => {
+            format!("support::console_print({}, true, false)", rendered_args[0])
+        }
+        StandardRuntimeAction::ConsoleEprint => {
+            format!("support::console_print({}, false, true)", rendered_args[0])
+        }
+        StandardRuntimeAction::ConsoleEprintln => {
+            format!("support::console_print({}, true, true)", rendered_args[0])
+        }
+        StandardRuntimeAction::ConsoleReadLine => "support::console_read_line()".to_string(),
+        StandardRuntimeAction::FileReadText => {
+            format!("support::file_read_text({})", rendered_args[0])
+        }
+        StandardRuntimeAction::FileWriteText => format!(
+            "support::file_write_text({}, {})",
+            rendered_args[0], rendered_args[1]
+        ),
+        StandardRuntimeAction::FileAppendText => format!(
+            "support::file_append_text({}, {})",
+            rendered_args[0], rendered_args[1]
+        ),
+        StandardRuntimeAction::FileExists => format!("support::file_exists({})", rendered_args[0]),
+    };
+
+    if rendered_args.len() != action.signature().params.len() {
+        return Err(vec![codegen_error(
+            span,
+            format!(
+                "call expects {} arguments, found {}",
+                action.signature().params.len(),
+                rendered_args.len()
+            ),
+        )]);
+    }
+
+    Ok(RustExpr::raw(expr))
+}
+
+fn lookup_standard_runtime_symbol(symbol: &TypedSymbol) -> Option<StandardRuntimeAction> {
+    standard_runtime::lookup_standard_runtime_name(&symbol.name)
 }
 
 fn lower_target_value(target: &TypedTarget) -> Result<RustExpr, Vec<Diagnostic>> {
@@ -1076,6 +1144,7 @@ const SUPPORT_MODULE: &str = r#"mod support {
     #![allow(dead_code)]
 
     use std::cell::RefCell;
+    use std::io::Write;
     use std::rc::Rc;
 
     pub trait Snapshot {
@@ -1176,6 +1245,61 @@ const SUPPORT_MODULE: &str = r#"mod support {
         let mut joined = left;
         joined.push_str(&right);
         joined
+    }
+
+    pub fn console_print(value: String, newline: bool, stderr: bool) -> Result<(), String> {
+        let result = if stderr {
+            let mut handle = std::io::stderr();
+            if newline {
+                writeln!(handle, "{value}")
+            } else {
+                write!(handle, "{value}")
+            }
+        } else {
+            let mut handle = std::io::stdout();
+            if newline {
+                writeln!(handle, "{value}")
+            } else {
+                write!(handle, "{value}")
+            }
+        };
+
+        result.map_err(|error| error.to_string())
+    }
+
+    pub fn console_read_line() -> Result<String, String> {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Err("end of input".to_string()),
+            Ok(_) => {
+                while matches!(line.chars().last(), Some('\n' | '\r')) {
+                    line.pop();
+                }
+                Ok(line)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub fn file_read_text(path: String) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|error| error.to_string())
+    }
+
+    pub fn file_write_text(path: String, content: String) -> Result<(), String> {
+        std::fs::write(path, content).map_err(|error| error.to_string())
+    }
+
+    pub fn file_append_text(path: String, content: String) -> Result<(), String> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(content.as_bytes()))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn file_exists(path: String) -> bool {
+        std::path::Path::new(&path).exists()
     }
 
     pub fn list_get<T: Snapshot>(items: &Rc<RefCell<Vec<T>>>, index: i64) -> T {

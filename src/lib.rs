@@ -5,8 +5,10 @@ pub mod diagnostics;
 pub mod externs;
 pub mod lexer;
 pub mod parser;
+pub mod repl;
 pub mod resolver;
 pub mod runtime;
+pub mod standard_runtime;
 pub mod tir;
 pub mod types;
 

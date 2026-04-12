@@ -6,6 +6,7 @@ use crate::ast::{
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::{Resolution, SymbolKind};
+use crate::standard_runtime::{self, StandardRuntimeAction};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -485,30 +486,34 @@ impl<'a> TypeChecker<'a> {
                 self.type_call(callee, args, scope, in_test, &expr.span)?
             }
             ExprKind::FieldAccess { base, field } => {
-                let base_type = self.type_expr(base, scope, in_test)?;
-                match base_type {
-                    Type::Record(record_name) => {
-                        let record = self.records.get(&record_name).ok_or_else(|| {
-                            vec![type_error(
+                if let Some(action) = lookup_standard_runtime_action(base, field) {
+                    Type::Action(action.signature())
+                } else {
+                    let base_type = self.type_expr(base, scope, in_test)?;
+                    match base_type {
+                        Type::Record(record_name) => {
+                            let record = self.records.get(&record_name).ok_or_else(|| {
+                                vec![type_error(
+                                    &expr.span,
+                                    format!("unknown record type `{record_name}`"),
+                                )]
+                            })?;
+                            record.fields.get(field).cloned().ok_or_else(|| {
+                                vec![type_error(
+                                    &expr.span,
+                                    format!("record `{record_name}` has no field `{field}`"),
+                                )]
+                            })?
+                        }
+                        other => {
+                            return Err(vec![type_error(
                                 &expr.span,
-                                format!("unknown record type `{record_name}`"),
-                            )]
-                        })?;
-                        record.fields.get(field).cloned().ok_or_else(|| {
-                            vec![type_error(
-                                &expr.span,
-                                format!("record `{record_name}` has no field `{field}`"),
-                            )]
-                        })?
-                    }
-                    other => {
-                        return Err(vec![type_error(
-                            &expr.span,
-                            format!(
-                                "field access requires a record, found `{}`",
-                                other.describe()
-                            ),
-                        )]);
+                                format!(
+                                    "field access requires a record, found `{}`",
+                                    other.describe()
+                                ),
+                            )]);
+                        }
                     }
                 }
             }
@@ -597,6 +602,12 @@ impl<'a> TypeChecker<'a> {
         in_test: bool,
         span: &SourceSpan,
     ) -> Result<Type, Vec<Diagnostic>> {
+        if let Some(action) = lookup_standard_runtime_callee(callee) {
+            self.expr_types
+                .insert(callee.id, Type::Action(action.signature()));
+            return self.type_standard_runtime_call(action, args, scope, in_test, span);
+        }
+
         if let ExprKind::Name(name) = &callee.kind {
             if let Some(record) = self.records.get(name) {
                 self.expr_types
@@ -676,6 +687,50 @@ impl<'a> TypeChecker<'a> {
         }
 
         Ok(*action_type.result)
+    }
+
+    fn type_standard_runtime_call(
+        &mut self,
+        action: StandardRuntimeAction,
+        args: &[CallArg],
+        scope: &mut Scope,
+        in_test: bool,
+        span: &SourceSpan,
+    ) -> Result<Type, Vec<Diagnostic>> {
+        let signature = action.signature();
+
+        if signature.params.len() != args.len() {
+            return Err(vec![type_error(
+                span,
+                format!(
+                    "call expects {} arguments, found {}",
+                    signature.params.len(),
+                    args.len()
+                ),
+            )]);
+        }
+
+        for (expected, arg) in signature.params.iter().zip(args) {
+            if arg.name.is_some() {
+                return Err(vec![type_error(
+                    &arg.span,
+                    "standard runtime calls do not support named arguments",
+                )]);
+            }
+            let actual = self.type_expr(&arg.expr, scope, in_test)?;
+            if !is_assignable(expected, &actual) {
+                return Err(vec![type_error(
+                    &arg.expr.span,
+                    format!(
+                        "argument expected `{}`, found `{}`",
+                        expected.describe(),
+                        actual.describe()
+                    ),
+                )]);
+            }
+        }
+
+        Ok(*signature.result)
     }
 
     fn type_target(
@@ -827,6 +882,9 @@ impl<'a> TypeChecker<'a> {
             .get(name)
             .is_some_and(|symbol| symbol.kind == SymbolKind::Import)
         {
+            return Ok(Type::Unknown);
+        }
+        if standard_runtime::is_standard_runtime_module(name) {
             return Ok(Type::Unknown);
         }
         Err(vec![Diagnostic::new(
@@ -1032,6 +1090,20 @@ fn is_assignable(expected: &Type, actual: &Type) -> bool {
 
 fn type_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(span.clone(), Phase::TypeCheck, message)
+}
+
+fn lookup_standard_runtime_action(base: &Expr, field: &str) -> Option<StandardRuntimeAction> {
+    let ExprKind::Name(module_name) = &base.kind else {
+        return None;
+    };
+    standard_runtime::lookup_standard_runtime_member(module_name, field)
+}
+
+fn lookup_standard_runtime_callee(callee: &Expr) -> Option<StandardRuntimeAction> {
+    let ExprKind::FieldAccess { base, field } = &callee.kind else {
+        return None;
+    };
+    lookup_standard_runtime_action(base, field)
 }
 
 impl Type {

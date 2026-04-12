@@ -48,7 +48,8 @@ cargo install --path .
 ## Usage
 
 ```text
-vulgata <command> <source-file>
+vulgata <parse|check|run|test|compile> <source-file>
+vulgata repl
 ```
 
 | Command | Description |
@@ -58,6 +59,7 @@ vulgata <command> <source-file>
 | `run` | Interpret and execute the module |
 | `test` | Run all `test` blocks in the module |
 | `compile` | Emit Rust source code to `<file>.rs` |
+| `repl` | Start an interactive source-persistent REPL session |
 
 ### Examples
 
@@ -67,6 +69,7 @@ vulgata test   math.vg        # run inline tests, report PASS/FAIL
 vulgata check  sales.vg       # type-check only, no execution
 vulgata compile invoice.vg    # emit invoice.rs, then: rustc invoice.rs
 vulgata parse  foo.vg         # dump AST for debugging
+vulgata repl                  # interactive Vulgata session
 ```
 
 ---
@@ -83,7 +86,7 @@ This runs the conformance suite under [tests/conformance/](tests/conformance/). 
 
 ## Quick tutorial
 
-The full language is specified in [spec/vulgata_spec_v0.3.md](spec/vulgata_spec_v0.3.md). What follows is a short taste.
+The full language is specified in [spec/vulgata_spec_v0.4.md](spec/vulgata_spec_v0.4.md). What follows is a short taste.
 
 ### Hello, Vulgata
 
@@ -101,7 +104,29 @@ Run it:
 
 ```sh
 vulgata run hello.vg
-# "Hello, world!"
+# Text("Hello, world!")
+```
+
+### Standard runtime modules
+
+The initial standard runtime library exposes `console` and `file` as ordinary module actions:
+
+```text
+action main() -> Bool:
+  let _ = console.println("Checking whether README.md exists...")
+  return file.exists("README.md")
+```
+
+```sh
+vulgata run examples/runtime_io.vg
+# Bool(true)
+```
+
+Note that runtime I/O actions are ordinary action calls and most of them are fallible:
+
+```text
+action announce() -> Result[None, Text]:
+  return console.println("Hello from Vulgata")
 ```
 
 ### Types and mutability
@@ -171,6 +196,27 @@ rustc math.rs -o math
 ```
 
 The emitted Rust is plain, readable code — no VM, no runtime dependency.
+
+### REPL
+
+Vulgata also provides a small interactive REPL:
+
+```sh
+vulgata repl
+```
+
+The REPL keeps an in-memory virtual source file. Submit a source block with a trailing empty line, then use commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit`.
+
+Example session:
+
+```text
+> action main() -> Int:
+|   return 42
+|
+ok: block added
+> :run
+Int(42)
+```
 
 ---
 

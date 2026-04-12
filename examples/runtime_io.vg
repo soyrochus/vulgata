@@ -1,0 +1,8 @@
+# Run:
+#   cargo run -- run examples/runtime_io.vg
+#
+# This example uses the initial standard runtime modules.
+
+action main() -> Bool:
+  let _ = console.println("Checking whether README.md exists...")
+  return file.exists("README.md")

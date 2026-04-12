@@ -1,6 +1,7 @@
 use crate::ast::{BinaryOp, CallArg, Decl, Expr, ExprKind, Stmt, StmtKind, Target, UnaryOp};
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
+use crate::standard_runtime;
 use crate::types::{CheckedModule, Type};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -453,10 +454,19 @@ fn lower_expr(checked: &CheckedModule, expr: &Expr) -> Result<TypedExpr, Vec<Dia
                 .map(|arg| lower_call_arg(checked, arg))
                 .collect::<Result<Vec<_>, _>>()?,
         },
-        ExprKind::FieldAccess { base, field } => TypedExprKind::FieldAccess {
-            base: Box::new(lower_expr(checked, base)?),
-            field: field.clone(),
-        },
+        ExprKind::FieldAccess { base, field } => {
+            if let Some(action) = lookup_standard_runtime_action(base, field) {
+                TypedExprKind::Symbol(TypedSymbol {
+                    name: action.qualified_name().to_string(),
+                    kind: Some(SymbolKind::Runtime),
+                })
+            } else {
+                TypedExprKind::FieldAccess {
+                    base: Box::new(lower_expr(checked, base)?),
+                    field: field.clone(),
+                }
+            }
+        }
         ExprKind::Index { base, index } => TypedExprKind::Index {
             base: Box::new(lower_expr(checked, base)?),
             index: Box::new(lower_expr(checked, index)?),
@@ -483,6 +493,16 @@ fn lower_call_arg(checked: &CheckedModule, arg: &CallArg) -> Result<TypedCallArg
         name: arg.name.clone(),
         expr: lower_expr(checked, &arg.expr)?,
     })
+}
+
+fn lookup_standard_runtime_action(
+    base: &Expr,
+    field: &str,
+) -> Option<standard_runtime::StandardRuntimeAction> {
+    let ExprKind::Name(module_name) = &base.kind else {
+        return None;
+    };
+    standard_runtime::lookup_standard_runtime_member(module_name, field)
 }
 
 fn expr_type(checked: &CheckedModule, expr: &Expr) -> Result<Type, Vec<Diagnostic>> {

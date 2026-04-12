@@ -7,6 +7,7 @@ use crate::diagnostics::{Diagnostic, Phase};
 pub enum SymbolKind {
     Module,
     Import,
+    Runtime,
     Const,
     Record,
     Enum,
