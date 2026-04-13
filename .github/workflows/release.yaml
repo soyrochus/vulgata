@@ -1,0 +1,178 @@
+name: Release (Linux + macOS arm64 + Windows)
+
+on:
+  push:
+    tags: [ "v*" ]     # e.g., v0.1.0
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86_64 musl)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin_path: target/x86_64-unknown-linux-musl/release/vulgata
+            pkg_name: vulgata-linux-x86_64
+            final_name: vulgata
+            archive_ext: tar.gz
+
+          - name: macOS (arm64)
+            os: macos-latest
+            target: ""   # host default: aarch64-apple-darwin
+            bin_path: target/release/vulgata
+            pkg_name: vulgata-macos-arm64
+            final_name: vulgata
+            archive_ext: zip
+
+          - name: Windows (x86_64)
+            os: windows-latest
+            target: ""   # host default: x86_64-pc-windows-msvc
+            bin_path: target\\release\\vulgata.exe
+            pkg_name: vulgata-windows-x86_64
+            final_name: vulgata.exe
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # macOS: broaden compatibility
+      - name: Set macOS deployment target (Monterey+)
+        if: matrix.os == 'macos-latest'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=12.0" >> $GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Linux musl target
+      - name: Install Linux deps (musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Build
+      - name: Build (custom target)
+        if: matrix.target != ''
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (host target)
+        if: matrix.target == ''
+        run: cargo build --release
+
+      # Strip binaries (skip Windows — keep it simple)
+      - name: Strip (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: strip ${{ matrix.bin_path }}
+
+      - name: Strip (macOS)
+        if: matrix.os == 'macos-latest'
+        run: strip -x ${{ matrix.bin_path }}
+
+      # Stage package folder
+      - name: Stage files (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p pkg
+          cp "${{ matrix.bin_path }}" "pkg/${{ matrix.final_name }}"
+          [ -f LICENSE ] && cp LICENSE pkg/
+          [ -f README.md ] && cp README.md pkg/
+
+      - name: Stage files (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg | Out-Null
+          Copy-Item "${{ matrix.bin_path }}" "pkg\${{ matrix.final_name }}"
+          if (Test-Path LICENSE) { Copy-Item LICENSE pkg\ }
+          if (Test-Path README.md) { Copy-Item README.md pkg\ }
+
+      # Package per-OS
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd pkg
+          /usr/bin/zip -r "../${{ matrix.pkg_name }}.zip" ./*
+          cd -
+          shasum -a 256 "${{ matrix.pkg_name }}.zip" > "${{ matrix.pkg_name }}.zip.SHA256"
+
+      - name: Package (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          tar -C pkg -czf "${{ matrix.pkg_name }}.tar.gz" .
+          shasum -a 256 "${{ matrix.pkg_name }}.tar.gz" > "${{ matrix.pkg_name }}.tar.gz.SHA256"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path pkg\* -DestinationPath "${{ matrix.pkg_name }}.zip"
+          $hash = (Get-FileHash "${{ matrix.pkg_name }}.zip" -Algorithm SHA256).Hash
+          "$hash  $PWD\${{ matrix.pkg_name }}.zip" | Out-File "${{ matrix.pkg_name }}.zip.SHA256" -Encoding ascii
+
+      # Upload packaged artifacts for the release job
+      - name: Upload artifact (macOS/Windows)
+        uses: actions/upload-artifact@v4
+        if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
+        with:
+          name: ${{ matrix.pkg_name }}-pkg
+          path: |
+            ${{ matrix.pkg_name }}.zip
+            ${{ matrix.pkg_name }}.zip.SHA256
+          if-no-files-found: error
+
+      - name: Upload artifact (Linux)
+        uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: ${{ matrix.pkg_name }}-pkg
+          path: |
+            ${{ matrix.pkg_name }}.tar.gz
+            ${{ matrix.pkg_name }}.tar.gz.SHA256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -la dist
+
+      - name: Create Release and upload assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vulgata-linux-x86_64.tar.gz
+            dist/vulgata-linux-x86_64.tar.gz.SHA256
+            dist/vulgata-macos-arm64.zip
+            dist/vulgata-macos-arm64.zip.SHA256
+            dist/vulgata-windows-x86_64.zip
+            dist/vulgata-windows-x86_64.zip.SHA256
+          generate_release_notes: true
