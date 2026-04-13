@@ -50,8 +50,8 @@ cargo install --path .
 ## Usage
 
 ```text
-vulgata <parse|check|run|test|compile> <source-file>
-vulgata repl
+vulgata <parse|check|run|test|compile> [options] <source-file>
+vulgata repl [--mode <release|checked|debug|tooling>]
 ```
 
 | Command | Description |
@@ -63,12 +63,19 @@ vulgata repl
 | `compile` | Emit Rust source code to `<file>.rs` |
 | `repl` | Start an interactive source-persistent REPL session |
 
+Useful options:
+
+* `--mode <release|checked|debug|tooling>` for `run`, `test`, and `repl`
+* `--emit-metadata <path>` to write semantic-layer metadata JSON without requiring execution
+
 ### Examples
 
 ```sh
 vulgata run    hello.vg       # interpret and print the return value
+vulgata run --mode checked hello.vg
 vulgata test   math.vg        # run inline tests, report PASS/FAIL
 vulgata check  sales.vg       # type-check only, no execution
+vulgata check --emit-metadata sales.json sales.vg
 vulgata compile invoice.vg    # emit invoice.rs, then: rustc invoice.rs
 vulgata parse  foo.vg         # dump AST for debugging
 vulgata repl                  # interactive Vulgata session
@@ -88,7 +95,14 @@ This runs the conformance suite under [tests/conformance/](tests/conformance/). 
 
 ## Quick tutorial
 
-The full language is specified in [spec/vulgata_spec_v0.4.md](spec/vulgata_spec_v0.4.md). What follows is a short taste.
+The full language reference is now split into a small set of spec documents:
+
+* [docs/01_vulgata_spec_intro.md](docs/01_vulgata_spec_intro.md)
+* [docs/02_vulgata_spec_language_reference.md](docs/02_vulgata_spec_language_reference.md)
+* [docs/03_vulgata_spec_execution_model.md](docs/03_vulgata_spec_execution_model.md)
+* [docs/04_vulgata_spec_implementation_contract.md](docs/04_vulgata_spec_implementation_contract.md)
+
+What follows is still just a short taste.
 
 ### Hello, Vulgata
 
@@ -144,6 +158,101 @@ action countdown(n: Int) -> Int:
     i := i - 1
   return total
 ```
+
+### Intent, contracts, and execution modes
+
+Vulgata v0.5 also has a first semantic layer system. Some constructs are descriptive only, and some are checkable depending on the active mode:
+
+```text
+action normalize(value: Int) -> Int:
+  intent:
+    goal: "Clamp a score into the accepted range"
+  requires value >= -100
+  if value < 0:
+    return 0
+  ensures result >= 0
+  return value
+```
+
+In `release` mode, descriptive and checkable constructs are stripped from execution. In `checked` and `debug`, contracts are enforced.
+
+```sh
+vulgata run --mode release score.vg
+vulgata run --mode checked score.vg
+```
+
+### More semantic-layer examples
+
+Field-level `meaning:` attaches descriptive metadata to records:
+
+```text
+record Customer:
+  email: Text
+    meaning: "Primary contact address"
+  active: Bool
+    meaning: "Whether the customer can receive notifications"
+```
+
+`explain:` gives a human-readable description inside an action body without changing runtime behavior:
+
+```text
+action shipping_band(total: Int) -> Text:
+  explain:
+    "Orders below 50 stay in the standard band"
+    "Orders from 50 upward become priority"
+  if total < 50:
+    return "standard"
+  return "priority"
+```
+
+`step` labels wrap ordinary executable code. In `debug` mode the label can be emitted as a trace:
+
+```text
+action sum_to(n: Int) -> Int:
+  var i = 0
+  var total = 0
+  step accumulate:
+    while i < n:
+      i := i + 1
+      total := total + i
+  return total
+```
+
+`example` embeds checkable examples directly in the action:
+
+```text
+action clamp(value: Int) -> Int:
+  example below_zero:
+    input:
+      value = -1
+    output:
+      result = 0
+
+  example already_valid:
+    input:
+      value = 12
+    output:
+      result = 12
+
+  if value < 0:
+    return 0
+  return value
+```
+
+Run those checks in a checking mode:
+
+```sh
+vulgata run --mode checked clamp.vg
+```
+
+You can also export semantic metadata without executing the program:
+
+```sh
+vulgata check --emit-metadata clamp.json clamp.vg
+cat clamp.json
+```
+
+The emitted JSON includes the module name plus semantic-layer data such as action intent, contracts, steps, examples, and field meanings when present.
 
 ### Records and enums
 
@@ -205,6 +314,8 @@ Vulgata also provides a small interactive REPL:
 
 ```sh
 vulgata repl
+# or:
+vulgata repl --mode tooling
 ```
 
 The REPL keeps an in-memory virtual source file for declarations and also maintains session-local `let`/`var` bindings. Submit a declaration block with a trailing empty line to extend the session source, submit an expression block to evaluate it against the current session, or submit `let`/`var`/`:=` statements to work with REPL-local bindings. In a modern terminal the CLI REPL now provides basic line editing, cursor movement, and input history. Commands such as `:show`, `:check`, `:run`, `:test`, `:reset`, and `:quit` remain available.
