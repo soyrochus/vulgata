@@ -98,6 +98,7 @@ pub struct RecordDecl {
 pub struct FieldDecl {
     pub name: String,
     pub ty: TypeRef,
+    pub meaning: Option<String>,
     pub span: SourceSpan,
 }
 
@@ -169,6 +170,30 @@ pub struct Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
+    IntentBlock {
+        goal: Option<String>,
+        constraints: Vec<String>,
+        assumptions: Vec<String>,
+        properties: Vec<String>,
+    },
+    ExplainBlock {
+        lines: Vec<String>,
+    },
+    StepBlock {
+        label: String,
+        body: Vec<Stmt>,
+    },
+    RequiresClause {
+        condition: Expr,
+    },
+    EnsuresClause {
+        condition: Expr,
+    },
+    ExampleBlock {
+        name: String,
+        inputs: Vec<(String, Expr)>,
+        outputs: Vec<(String, Expr)>,
+    },
     Let {
         name: String,
         explicit_type: Option<TypeRef>,

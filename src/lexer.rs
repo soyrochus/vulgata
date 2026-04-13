@@ -21,6 +21,19 @@ pub enum Token {
     Impure,
     Action,
     Test,
+    Intent,
+    Meaning,
+    Explain,
+    Step,
+    Requires,
+    Ensures,
+    Example,
+    Goal,
+    Constraints,
+    Assumptions,
+    Properties,
+    Input,
+    Output,
     Let,
     Var,
     If,
@@ -404,6 +417,19 @@ fn keyword_or_ident(ident: &str) -> Token {
         "impure" => Token::Impure,
         "action" => Token::Action,
         "test" => Token::Test,
+        "intent" => Token::Intent,
+        "meaning" => Token::Meaning,
+        "explain" => Token::Explain,
+        "step" => Token::Step,
+        "requires" => Token::Requires,
+        "ensures" => Token::Ensures,
+        "example" => Token::Example,
+        "goal" => Token::Goal,
+        "constraints" => Token::Constraints,
+        "assumptions" => Token::Assumptions,
+        "properties" => Token::Properties,
+        "input" => Token::Input,
+        "output" => Token::Output,
         "let" => Token::Let,
         "var" => Token::Var,
         "if" => Token::If,
@@ -447,10 +473,23 @@ mod tests {
 
     #[test]
     fn lexes_keywords_operators_and_literals() {
-        let source = "var value = 42 + 1.5\nvalue := value + 1\nexpect value != 0\n";
+        let source = "intent explain step requires ensures example goal constraints assumptions properties input output var value = 42 + 1.5\nvalue := value + 1\nexpect value != 0\n";
         let tokens = Lexer::new(Path::new("test.vg"), source)
             .tokenize()
             .expect("tokenize");
+        assert!(kinds(&tokens).contains(&Token::Intent));
+        assert!(kinds(&tokens).contains(&Token::Meaning) == false);
+        assert!(kinds(&tokens).contains(&Token::Explain));
+        assert!(kinds(&tokens).contains(&Token::Step));
+        assert!(kinds(&tokens).contains(&Token::Requires));
+        assert!(kinds(&tokens).contains(&Token::Ensures));
+        assert!(kinds(&tokens).contains(&Token::Example));
+        assert!(kinds(&tokens).contains(&Token::Goal));
+        assert!(kinds(&tokens).contains(&Token::Constraints));
+        assert!(kinds(&tokens).contains(&Token::Assumptions));
+        assert!(kinds(&tokens).contains(&Token::Properties));
+        assert!(kinds(&tokens).contains(&Token::Input));
+        assert!(kinds(&tokens).contains(&Token::Output));
         assert!(kinds(&tokens).contains(&Token::Var));
         assert!(kinds(&tokens).contains(&Token::Expect));
         assert!(kinds(&tokens).contains(&Token::IntLiteral(42)));
@@ -491,5 +530,16 @@ mod tests {
             2
         );
         assert!(matches!(kinds.last(), Some(Token::Eof)));
+    }
+
+    #[test]
+    fn keeps_non_keyword_identifiers_as_identifiers() {
+        let source = "action main(goal_value: Int, output_value: Int) -> Int:\n  let explainable = goal_value + output_value\n  return explainable\n";
+        let tokens = Lexer::new(Path::new("test.vg"), source)
+            .tokenize()
+            .expect("tokenize");
+        assert!(kinds(&tokens).contains(&Token::Identifier("goal_value".to_string())));
+        assert!(kinds(&tokens).contains(&Token::Identifier("output_value".to_string())));
+        assert!(kinds(&tokens).contains(&Token::Identifier("explainable".to_string())));
     }
 }

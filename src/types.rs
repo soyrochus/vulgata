@@ -237,6 +237,56 @@ impl<'a> TypeChecker<'a> {
         loop_depth: usize,
     ) -> Result<(), Vec<Diagnostic>> {
         match &stmt.kind {
+            StmtKind::IntentBlock { .. } | StmtKind::ExplainBlock { .. } => {}
+            StmtKind::StepBlock { body, .. } => {
+                self.type_block(body, scope, in_test, expected_return, loop_depth)?;
+            }
+            StmtKind::RequiresClause { condition } => {
+                let condition_type = self.type_expr(condition, scope, in_test)?;
+                if condition_type != Type::Bool {
+                    return Err(vec![type_error(
+                        &condition.span,
+                        format!(
+                            "requires expression must be `Bool`, found `{}`",
+                            condition_type.describe()
+                        ),
+                    )]);
+                }
+            }
+            StmtKind::EnsuresClause { condition } => {
+                let mut ensures_scope = scope.clone();
+                ensures_scope.insert("result".to_string(), expected_return.clone(), false);
+                let condition_type = self.type_expr(condition, &mut ensures_scope, in_test)?;
+                if condition_type != Type::Bool {
+                    return Err(vec![type_error(
+                        &condition.span,
+                        format!(
+                            "ensures expression must be `Bool`, found `{}`",
+                            condition_type.describe()
+                        ),
+                    )]);
+                }
+            }
+            StmtKind::ExampleBlock {
+                inputs, outputs, ..
+            } => {
+                for (_, expr) in inputs {
+                    self.type_expr(expr, scope, in_test)?;
+                }
+                for (_, expr) in outputs {
+                    let actual = self.type_expr(expr, scope, in_test)?;
+                    if !is_assignable(expected_return, &actual) {
+                        return Err(vec![type_error(
+                            &expr.span,
+                            format!(
+                                "example output expected `{}`, found `{}`",
+                                expected_return.describe(),
+                                actual.describe()
+                            ),
+                        )]);
+                    }
+                }
+            }
             StmtKind::Let {
                 name,
                 explicit_type,
@@ -406,12 +456,6 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             StmtKind::Expect(expr) => {
-                if !in_test {
-                    return Err(vec![type_error(
-                        &stmt.span,
-                        "`expect` is only supported inside test blocks",
-                    )]);
-                }
                 let condition_type = self.type_expr(expr, scope, in_test)?;
                 if condition_type != Type::Bool {
                     return Err(vec![type_error(
@@ -1401,6 +1445,43 @@ action main(customer: Customer) -> Text:
   var current = customer
   current.email := "after"
   return customer.email
+"#,
+        )
+        .expect("check should succeed");
+    }
+
+    #[test]
+    fn rejects_non_boolean_requires_clause() {
+        let diagnostics = check(
+            r#"
+action main(value: Int) -> Int:
+  requires value + 1
+  return value
+"#,
+        )
+        .expect_err("check should fail");
+        assert!(diagnostics[0].message.contains("requires expression must be `Bool`"));
+    }
+
+    #[test]
+    fn allows_result_binding_inside_ensures() {
+        check(
+            r#"
+action main(value: Int) -> Int:
+  ensures result > 0
+  return value
+"#,
+        )
+        .expect("check should succeed");
+    }
+
+    #[test]
+    fn allows_expect_inside_action_bodies() {
+        check(
+            r#"
+action main() -> Int:
+  expect true
+  return 1
 "#,
         )
         .expect("check should succeed");

@@ -11,7 +11,7 @@
 
 ## 1. Purpose
 
-Vulgata is a compact, human-readable, executable language designed as a lingua franca for humans and AI systems collaborating on software design, algorithm specification, workflow definition, and lightweight application logic.
+Vulgata is a compact, human-readable, executable language designed as a lingua franca for humans and AI systems collaborating on software design, algorithm specification, workflow definition, and lightweight application logic. Its syntax is whitespace-delimited and indentation-based, inspired by Python, making it easy to read and write without visual noise.
 
 It is not intended to compete with Python, Rust, or Java as a general-purpose systems language. Its design target is different:
 
@@ -34,7 +34,7 @@ The canonical source language is the same in both cases. Semantics must match.
 **Prerequisites:** Rust toolchain (stable, 1.85+). Install via [rustup](https://rustup.rs).
 
 ```sh
-git clone https://github.com/your-org/vulgata.git
+git clone https://github.com/soyrochus/vulgata.git
 cd vulgata
 cargo build --release
 ```

@@ -4,6 +4,7 @@ pub mod codegen;
 pub mod diagnostics;
 pub mod externs;
 pub mod lexer;
+pub mod metadata;
 pub mod parser;
 pub mod repl;
 pub mod resolver;
@@ -58,8 +59,16 @@ pub fn lower_source(path: &Path, source: &str) -> FrontendResult<TypedIrModule> 
 }
 
 pub fn run_source(path: &Path, source: &str) -> FrontendResult<runtime::RunResult> {
+    run_source_in_mode(path, source, runtime::ExecutionMode::Release)
+}
+
+pub fn run_source_in_mode(
+    path: &Path,
+    source: &str,
+    mode: runtime::ExecutionMode,
+) -> FrontendResult<runtime::RunResult> {
     let lowered = lower_source(path, source)?;
-    let interpreter = runtime::Interpreter::new(&lowered)?;
+    let interpreter = runtime::Interpreter::new_with_mode(&lowered, mode)?;
     interpreter.run_main()
 }
 
@@ -73,7 +82,8 @@ pub fn eval_expression_source(
     let checked_expr = types::check_expression(&checked, &expression)?;
     let typed_expr = tir::lower_expression(&checked, &expression, &checked_expr.expr_types)?;
     let lowered = tir::lower_module(&checked)?;
-    let interpreter = runtime::Interpreter::new(&lowered)?;
+    let interpreter =
+        runtime::Interpreter::new_with_mode(&lowered, runtime::ExecutionMode::Checked)?;
     interpreter.eval_expression(&typed_expr)
 }
 
@@ -89,7 +99,8 @@ pub fn eval_expression_source_with_bindings(
     let checked_expr = types::check_expression_with_bindings(&checked, &expression, bindings)?;
     let typed_expr = tir::lower_expression(&checked, &expression, &checked_expr.expr_types)?;
     let lowered = tir::lower_module(&checked)?;
-    let interpreter = runtime::Interpreter::new(&lowered)?;
+    let interpreter =
+        runtime::Interpreter::new_with_mode(&lowered, runtime::ExecutionMode::Checked)?;
 
     let env = values.clone();
     for (name, binding) in bindings {
@@ -108,8 +119,16 @@ pub fn eval_expression_source_with_bindings(
 }
 
 pub fn test_source(path: &Path, source: &str) -> FrontendResult<Vec<runtime::TestResult>> {
+    test_source_in_mode(path, source, runtime::ExecutionMode::Checked)
+}
+
+pub fn test_source_in_mode(
+    path: &Path,
+    source: &str,
+    mode: runtime::ExecutionMode,
+) -> FrontendResult<Vec<runtime::TestResult>> {
     let lowered = lower_source(path, source)?;
-    let interpreter = runtime::Interpreter::new(&lowered)?;
+    let interpreter = runtime::Interpreter::new_with_mode(&lowered, mode)?;
     interpreter.run_tests()
 }
 
@@ -117,4 +136,9 @@ pub fn compile_source(path: &Path, source: &str) -> FrontendResult<String> {
     let lowered = lower_source(path, source)?;
     let rust_module = codegen::lower_module(&lowered)?;
     Ok(codegen::emit_module(&rust_module))
+}
+
+pub fn emit_metadata_source(path: &Path, source: &str) -> FrontendResult<serde_json::Value> {
+    let checked = check_source(path, source)?;
+    Ok(metadata::emit_metadata(&checked.module))
 }

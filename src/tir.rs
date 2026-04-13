@@ -34,8 +34,15 @@ pub struct TypedConstDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedRecordDecl {
     pub name: String,
-    pub fields: Vec<(String, Type)>,
+    pub fields: Vec<TypedRecordField>,
     pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedRecordField {
+    pub name: String,
+    pub ty: Type,
+    pub meaning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +83,26 @@ pub struct TypedStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedStmtKind {
+    IntentBlock {
+        goal: Option<String>,
+        constraints: Vec<String>,
+        assumptions: Vec<String>,
+        properties: Vec<String>,
+    },
+    ExplainBlock {
+        lines: Vec<String>,
+    },
+    StepBlock {
+        label: String,
+        body: Vec<TypedStmt>,
+    },
+    RequiresClause(TypedExpr),
+    EnsuresClause(TypedExpr),
+    ExampleBlock {
+        name: String,
+        inputs: Vec<(String, TypedExpr)>,
+        outputs: Vec<(String, TypedExpr)>,
+    },
     Let {
         name: String,
         ty: Type,
@@ -247,10 +274,11 @@ fn lower_decl(checked: &CheckedModule, decl: &Decl) -> Result<TypedDecl, Vec<Dia
                 .fields
                 .iter()
                 .map(|field| {
-                    Ok((
-                        field.name.clone(),
-                        lower_type_ref(&field.ty, checked, &field.span)?,
-                    ))
+                    Ok(TypedRecordField {
+                        name: field.name.clone(),
+                        ty: lower_type_ref(&field.ty, checked, &field.span)?,
+                        meaning: field.meaning.clone(),
+                    })
                 })
                 .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?;
             Ok(TypedDecl::Record(TypedRecordDecl {
@@ -322,6 +350,48 @@ fn lower_decl(checked: &CheckedModule, decl: &Decl) -> Result<TypedDecl, Vec<Dia
 
 fn lower_stmt(checked: &CheckedModule, stmt: &Stmt) -> Result<TypedStmt, Vec<Diagnostic>> {
     let kind = match &stmt.kind {
+        StmtKind::IntentBlock {
+            goal,
+            constraints,
+            assumptions,
+            properties,
+        } => TypedStmtKind::IntentBlock {
+            goal: goal.clone(),
+            constraints: constraints.clone(),
+            assumptions: assumptions.clone(),
+            properties: properties.clone(),
+        },
+        StmtKind::ExplainBlock { lines } => TypedStmtKind::ExplainBlock {
+            lines: lines.clone(),
+        },
+        StmtKind::StepBlock { label, body } => TypedStmtKind::StepBlock {
+            label: label.clone(),
+            body: body
+                .iter()
+                .map(|stmt| lower_stmt(checked, stmt))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        StmtKind::RequiresClause { condition } => {
+            TypedStmtKind::RequiresClause(lower_expr(checked, condition)?)
+        }
+        StmtKind::EnsuresClause { condition } => {
+            TypedStmtKind::EnsuresClause(lower_expr(checked, condition)?)
+        }
+        StmtKind::ExampleBlock {
+            name,
+            inputs,
+            outputs,
+        } => TypedStmtKind::ExampleBlock {
+            name: name.clone(),
+            inputs: inputs
+                .iter()
+                .map(|(name, expr)| Ok((name.clone(), lower_expr(checked, expr)?)))
+                .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+            outputs: outputs
+                .iter()
+                .map(|(name, expr)| Ok((name.clone(), lower_expr(checked, expr)?)))
+                .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+        },
         StmtKind::Let {
             name,
             explicit_type,
@@ -678,6 +748,50 @@ test smoke:
         match &lowered.declarations[2] {
             TypedDecl::Test(test_decl) => {
                 assert!(matches!(test_decl.body[0].kind, TypedStmtKind::Expect(_)));
+            }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_semantic_layer_nodes() {
+        let source = r#"
+record Customer:
+  email: Text
+    meaning: "primary contact"
+
+action main(value: Int) -> Int:
+  intent:
+    goal: "return the value"
+  explain:
+    "first line"
+  requires value > 0
+  step compute:
+    return value
+  ensures result > 0
+"#;
+        let path = Path::new("test.vg");
+        let tokens = Lexer::new(path, source).tokenize().expect("tokenize");
+        let module = Parser::new(path, tokens).parse_module().expect("parse");
+        let resolution = Resolver::new(&module).resolve().expect("resolve");
+        let checked = TypeChecker::new(&module, &resolution)
+            .check()
+            .expect("check");
+        let lowered = lower_module(&checked).expect("lower");
+
+        match &lowered.declarations[0] {
+            TypedDecl::Record(record) => {
+                assert_eq!(record.fields[0].meaning.as_deref(), Some("primary contact"));
+            }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+        match &lowered.declarations[1] {
+            TypedDecl::Action(action) => {
+                assert!(matches!(action.body[0].kind, TypedStmtKind::IntentBlock { .. }));
+                assert!(matches!(action.body[1].kind, TypedStmtKind::ExplainBlock { .. }));
+                assert!(matches!(action.body[2].kind, TypedStmtKind::RequiresClause(_)));
+                assert!(matches!(action.body[3].kind, TypedStmtKind::StepBlock { .. }));
+                assert!(matches!(action.body[4].kind, TypedStmtKind::EnsuresClause(_)));
             }
             other => panic!("unexpected declaration: {other:?}"),
         }

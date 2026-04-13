@@ -14,6 +14,7 @@ pub struct Parser {
     tokens: Vec<SpannedToken>,
     position: usize,
     next_node_id: NodeId,
+    action_body_depth: usize,
 }
 
 impl Parser {
@@ -23,6 +24,7 @@ impl Parser {
             tokens,
             position: 0,
             next_node_id: 1,
+            action_body_depth: 0,
         }
     }
 
@@ -132,6 +134,17 @@ impl Parser {
             Token::Extern => self.parse_extern_decl().map(Decl::Extern),
             Token::Action => self.parse_action_decl().map(Decl::Action),
             Token::Test => self.parse_test_decl().map(Decl::Test),
+            Token::Intent
+            | Token::Explain
+            | Token::Step
+            | Token::Requires
+            | Token::Ensures
+            | Token::Example => Err(vec![self.error_here(
+                "semantic-layer constructs are only allowed inside action bodies",
+            )]),
+            Token::Meaning => Err(vec![self.error_here(
+                "`meaning:` annotations are only allowed beneath record field declarations",
+            )]),
             _ => Err(vec![self.error_here("expected a top-level declaration")]),
         }
     }
@@ -165,9 +178,24 @@ impl Parser {
             self.expect_simple(Token::Colon, "expected `:` after field name")?;
             let field_type = self.parse_type()?;
             self.expect_newline("expected newline after field declaration")?;
+            let meaning = if self.at(&Token::Indent) {
+                self.bump();
+                self.expect_simple(Token::Meaning, "expected `meaning:` annotation")?;
+                self.expect_simple(Token::Colon, "expected `:` after `meaning`")?;
+                let meaning = self.expect_string_literal("expected text literal after `meaning:`")?;
+                self.expect_newline("expected newline after `meaning:` annotation")?;
+                self.expect_simple(
+                    Token::Dedent,
+                    "expected dedent after record field annotation block",
+                )?;
+                Some(meaning)
+            } else {
+                None
+            };
             fields.push(FieldDecl {
                 name: field_name,
                 ty: field_type,
+                meaning,
                 span: field_span,
             });
         }
@@ -260,7 +288,9 @@ impl Parser {
         };
         self.expect_simple(Token::Colon, "expected `:` after action signature")?;
         self.expect_newline("expected newline after action header")?;
+        self.action_body_depth += 1;
         let body = self.parse_block()?;
+        self.action_body_depth -= 1;
         Ok(ActionDecl {
             name,
             params,
@@ -296,6 +326,30 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, Vec<Diagnostic>> {
         let span = self.current_span();
         let kind = match self.current_token() {
+            Token::Intent => {
+                self.ensure_action_body_context("`intent:` blocks")?;
+                self.parse_intent_block()?
+            }
+            Token::Explain => {
+                self.ensure_action_body_context("`explain:` blocks")?;
+                self.parse_explain_block()?
+            }
+            Token::Step => {
+                self.ensure_action_body_context("`step` blocks")?;
+                self.parse_step_block()?
+            }
+            Token::Requires => {
+                self.ensure_action_body_context("`requires` clauses")?;
+                self.parse_requires_clause()?
+            }
+            Token::Ensures => {
+                self.ensure_action_body_context("`ensures` clauses")?;
+                self.parse_ensures_clause()?
+            }
+            Token::Example => {
+                self.ensure_action_body_context("`example` blocks")?;
+                self.parse_example_block()?
+            }
             Token::Let => self.parse_let_stmt()?,
             Token::Var => self.parse_var_stmt()?,
             Token::If => self.parse_if_stmt()?,
@@ -337,6 +391,147 @@ impl Parser {
             id: self.alloc_node_id(),
             kind,
             span,
+        })
+    }
+
+    fn parse_intent_block(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Intent, "expected `intent`")?;
+        self.expect_simple(Token::Colon, "expected `:` after `intent`")?;
+        self.expect_newline("expected newline after `intent:`")?;
+        self.expect_simple(Token::Indent, "expected an indented intent block")?;
+
+        let mut goal = None;
+        let mut constraints = Vec::new();
+        let mut assumptions = Vec::new();
+        let mut properties = Vec::new();
+
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            match self.current_token() {
+                Token::Goal => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `goal`")?;
+                    goal = Some(self.expect_string_literal("expected text literal for `goal:`")?);
+                    self.expect_newline("expected newline after `goal:`")?;
+                }
+                Token::Constraints => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `constraints`")?;
+                    self.expect_newline("expected newline after `constraints:`")?;
+                    constraints = self.parse_string_list_block("constraints")?;
+                }
+                Token::Assumptions => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `assumptions`")?;
+                    self.expect_newline("expected newline after `assumptions:`")?;
+                    assumptions = self.parse_string_list_block("assumptions")?;
+                }
+                Token::Properties => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `properties`")?;
+                    self.expect_newline("expected newline after `properties:`")?;
+                    properties = self.parse_string_list_block("properties")?;
+                }
+                _ => {
+                    return Err(vec![self.error_here(
+                        "unknown `intent:` field; expected `goal`, `constraints`, `assumptions`, or `properties`",
+                    )]);
+                }
+            }
+        }
+
+        self.expect_simple(Token::Dedent, "expected dedent after `intent:` block")?;
+        Ok(StmtKind::IntentBlock {
+            goal,
+            constraints,
+            assumptions,
+            properties,
+        })
+    }
+
+    fn parse_explain_block(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Explain, "expected `explain`")?;
+        self.expect_simple(Token::Colon, "expected `:` after `explain`")?;
+        self.expect_newline("expected newline after `explain:`")?;
+        self.expect_simple(Token::Indent, "expected an indented explain block")?;
+
+        let mut lines = Vec::new();
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            lines.push(self.expect_string_literal(
+                "expected a text literal line inside `explain:`",
+            )?);
+            self.expect_newline("expected newline after explain text")?;
+        }
+
+        self.expect_simple(Token::Dedent, "expected dedent after `explain:` block")?;
+        if lines.is_empty() {
+            return Err(vec![self.error_here("`explain:` block must contain at least one line")]);
+        }
+        Ok(StmtKind::ExplainBlock { lines })
+    }
+
+    fn parse_step_block(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Step, "expected `step`")?;
+        let label = self.expect_identifier("expected step label")?;
+        self.expect_simple(Token::Colon, "expected `:` after step label")?;
+        self.expect_newline("expected newline after step header")?;
+        let body = self.parse_block()?;
+        if body.is_empty() {
+            return Err(vec![self.error_here("`step` block must not be empty")]);
+        }
+        Ok(StmtKind::StepBlock { label, body })
+    }
+
+    fn parse_requires_clause(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Requires, "expected `requires`")?;
+        let condition = self.parse_expr()?;
+        self.expect_newline("expected newline after `requires` clause")?;
+        Ok(StmtKind::RequiresClause { condition })
+    }
+
+    fn parse_ensures_clause(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Ensures, "expected `ensures`")?;
+        let condition = self.parse_expr()?;
+        self.expect_newline("expected newline after `ensures` clause")?;
+        Ok(StmtKind::EnsuresClause { condition })
+    }
+
+    fn parse_example_block(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Example, "expected `example`")?;
+        let name = self.expect_identifier("expected example name")?;
+        self.expect_simple(Token::Colon, "expected `:` after example name")?;
+        self.expect_newline("expected newline after example header")?;
+        self.expect_simple(Token::Indent, "expected an indented example block")?;
+
+        let mut inputs = None;
+        let mut outputs = None;
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            match self.current_token() {
+                Token::Input => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `input`")?;
+                    self.expect_newline("expected newline after `input:`")?;
+                    inputs = Some(self.parse_example_bindings("input")?);
+                }
+                Token::Output => {
+                    self.bump();
+                    self.expect_simple(Token::Colon, "expected `:` after `output`")?;
+                    self.expect_newline("expected newline after `output:`")?;
+                    outputs = Some(self.parse_example_bindings("output")?);
+                }
+                _ => {
+                    return Err(vec![self.error_here(
+                        "example blocks only support `input:` and `output:` sub-blocks",
+                    )]);
+                }
+            }
+        }
+
+        self.expect_simple(Token::Dedent, "expected dedent after `example:` block")?;
+        Ok(StmtKind::ExampleBlock {
+            name,
+            inputs: inputs.ok_or_else(|| vec![self.error_here("example block requires `input:`")])?,
+            outputs: outputs
+                .ok_or_else(|| vec![self.error_here("example block requires `output:`")])?,
         })
     }
 
@@ -495,6 +690,55 @@ impl Parser {
         }
 
         Ok(target)
+    }
+
+    fn parse_string_list_block(&mut self, field_name: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+        self.expect_simple(
+            Token::Indent,
+            format!("expected an indented `{field_name}:` list"),
+        )?;
+        let mut items = Vec::new();
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            self.expect_simple(Token::Minus, format!("expected `-` list item in `{field_name}:`"))?;
+            items.push(self.expect_string_literal(format!(
+                "expected text literal list item in `{field_name}:`"
+            ))?);
+            self.expect_newline("expected newline after list item")?;
+        }
+        self.expect_simple(Token::Dedent, "expected dedent after list block")?;
+        Ok(items)
+    }
+
+    fn parse_example_bindings(
+        &mut self,
+        block_name: &str,
+    ) -> Result<Vec<(String, Expr)>, Vec<Diagnostic>> {
+        self.expect_simple(
+            Token::Indent,
+            format!("expected an indented `{block_name}:` block"),
+        )?;
+        let mut bindings = Vec::new();
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            let name = self.expect_identifier("expected binding name")?;
+            self.expect_simple(Token::Assign, "expected `=` in example binding")?;
+            let expr = self.parse_expr()?;
+            if !expr_is_literal(&expr) {
+                return Err(vec![Diagnostic::new(
+                    expr.span.clone(),
+                    Phase::Parse,
+                    "example bindings must use literal values",
+                )]);
+            }
+            self.expect_newline("expected newline after example binding")?;
+            bindings.push((name, expr));
+        }
+        self.expect_simple(Token::Dedent, "expected dedent after example binding block")?;
+        if bindings.is_empty() {
+            return Err(vec![self.error_here(format!(
+                "`{block_name}:` block must contain at least one binding"
+            ))]);
+        }
+        Ok(bindings)
     }
 
     fn is_assignment_stmt(&self) -> bool {
@@ -1051,7 +1295,7 @@ impl Parser {
     fn expect_simple(
         &mut self,
         expected: Token,
-        message: &'static str,
+        message: impl Into<String>,
     ) -> Result<SpannedToken, Vec<Diagnostic>> {
         if self.at(&expected) {
             let token = self.tokens[self.position].clone();
@@ -1068,6 +1312,20 @@ impl Parser {
                 let name = name.clone();
                 self.bump();
                 Ok(name)
+            }
+            _ => Err(vec![self.error_here(message)]),
+        }
+    }
+
+    fn expect_string_literal(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Result<String, Vec<Diagnostic>> {
+        match self.current_token() {
+            Token::StringLiteral(value) => {
+                let value = value.clone();
+                self.bump();
+                Ok(value)
             }
             _ => Err(vec![self.error_here(message)]),
         }
@@ -1108,10 +1366,40 @@ impl Parser {
         Diagnostic::new(self.current_span(), Phase::Parse, message)
     }
 
+    fn ensure_action_body_context(&self, construct: &str) -> Result<(), Vec<Diagnostic>> {
+        if self.action_body_depth == 0 {
+            Err(vec![self.error_here(format!(
+                "{construct} are only allowed inside action bodies"
+            ))])
+        } else {
+            Ok(())
+        }
+    }
+
     fn bump(&mut self) {
         if self.position + 1 < self.tokens.len() {
             self.position += 1;
         }
+    }
+}
+
+fn expr_is_literal(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Dec(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None => true,
+        ExprKind::List(items) | ExprKind::Tuple(items) => items.iter().all(expr_is_literal),
+        ExprKind::Map(entries) => entries
+            .iter()
+            .all(|(key, value)| expr_is_literal(key) && expr_is_literal(value)),
+        ExprKind::Name(_)
+        | ExprKind::Call { .. }
+        | ExprKind::FieldAccess { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. } => false,
     }
 }
 
@@ -1208,5 +1496,141 @@ test main_basic:
                 .message
                 .contains("legacy `set target = value` syntax is not supported")
         );
+    }
+
+    #[test]
+    fn parses_semantic_layer_constructs_inside_actions() {
+        let module = parse(
+            r#"
+record Customer:
+  email: Text
+    meaning: "primary address"
+
+action main(value: Int) -> Int:
+  intent:
+    goal: "return the value"
+    constraints:
+      - "must stay positive"
+    assumptions:
+      - "caller provides valid input"
+    properties:
+      - "deterministic"
+  explain:
+    "first line"
+    "second line"
+  requires value > 0
+  step compute:
+    return value
+  ensures result > 0
+  example works:
+    input:
+      value = 1
+    output:
+      result = 1
+"#,
+        );
+
+        match &module.declarations[0] {
+            Decl::Record(record) => {
+                assert_eq!(
+                    record.fields[0].meaning.as_deref(),
+                    Some("primary address")
+                );
+            }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+
+        match &module.declarations[1] {
+            Decl::Action(action) => {
+                assert!(matches!(action.body[0].kind, StmtKind::IntentBlock { .. }));
+                assert!(matches!(action.body[1].kind, StmtKind::ExplainBlock { .. }));
+                assert!(matches!(action.body[2].kind, StmtKind::RequiresClause { .. }));
+                assert!(matches!(action.body[3].kind, StmtKind::StepBlock { .. }));
+                assert!(matches!(action.body[4].kind, StmtKind::EnsuresClause { .. }));
+                assert!(matches!(action.body[5].kind, StmtKind::ExampleBlock { .. }));
+            }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_semantic_layer_constructs_outside_action_bodies() {
+        let tokens = Lexer::new(Path::new("bad.vg"), "intent:\n  goal: \"bad\"\n")
+            .tokenize()
+            .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(diagnostics[0].message.contains("only allowed inside action bodies"));
+    }
+
+    #[test]
+    fn rejects_unknown_intent_fields() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main() -> None:\n  intent:\n    mystery: \"bad\"\n  return\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(diagnostics[0].message.contains("unknown `intent:` field"));
+    }
+
+    #[test]
+    fn rejects_non_text_explain_lines() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main() -> None:\n  explain:\n    1\n  return\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(diagnostics[0].message.contains("text literal line"));
+    }
+
+    #[test]
+    fn rejects_empty_step_blocks() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main() -> None:\n  step compute:\n  return\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(!diagnostics.is_empty());
+    }
+
+    #[test]
+    fn rejects_example_blocks_without_required_sections() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main(value: Int) -> Int:\n  example bad:\n    input:\n      value = 1\n  return value\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(diagnostics[0].message.contains("requires `output:`"));
+    }
+
+    #[test]
+    fn rejects_non_literal_example_bindings() {
+        let tokens = Lexer::new(
+            Path::new("bad.vg"),
+            "action main(value: Int) -> Int:\n  example bad:\n    input:\n      value = value\n    output:\n      result = 1\n  return value\n",
+        )
+        .tokenize()
+        .expect("tokenize");
+        let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+            .parse_module()
+            .expect_err("parse should fail");
+        assert!(diagnostics[0].message.contains("literal values"));
     }
 }

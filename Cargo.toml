@@ -6,3 +6,4 @@ description = "Vulgata is a compact, human-readable, executable language designe
 
 [dependencies]
 rustyline = "14"
+serde_json = "1"

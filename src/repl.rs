@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::Decl;
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
-use crate::runtime::{TestResult, Value};
+use crate::runtime::{ExecutionMode, TestResult, Value};
 use crate::types::ReplBinding;
 
 const REPL_PATH: &str = "<repl>/session.vg";
@@ -16,6 +16,7 @@ pub struct ReplSession {
     source: String,
     bindings: HashMap<String, ReplBinding>,
     values: HashMap<String, Value>,
+    mode: ExecutionMode,
 }
 
 #[derive(Debug)]
@@ -26,11 +27,16 @@ pub enum ReplCommand {
 
 impl ReplSession {
     pub fn new() -> Self {
+        Self::with_mode(ExecutionMode::Tooling)
+    }
+
+    pub fn with_mode(mode: ExecutionMode) -> Self {
         Self {
             path: PathBuf::from(REPL_PATH),
             source: String::new(),
             bindings: HashMap::new(),
             values: HashMap::new(),
+            mode,
         }
     }
 
@@ -101,12 +107,20 @@ impl ReplSession {
             }
             ":run" => {
                 self.ensure_repl_execution_supported()?;
-                let result = crate::run_source(&self.path, &self.source)?;
+                let result = crate::run_source_in_mode(&self.path, &self.source, self.mode)?;
                 Ok(ReplCommand::Continue(vec![format!("{:?}", result.value)]))
             }
             ":test" => {
                 self.ensure_repl_execution_supported()?;
-                let results = crate::test_source(&self.path, &self.source)?;
+                let results = crate::test_source_in_mode(
+                    &self.path,
+                    &self.source,
+                    if self.mode == ExecutionMode::Tooling {
+                        ExecutionMode::Checked
+                    } else {
+                        self.mode
+                    },
+                )?;
                 Ok(ReplCommand::Continue(format_test_results(&results)))
             }
             ":quit" => Ok(ReplCommand::Quit(Vec::new())),
@@ -140,7 +154,7 @@ impl ReplSession {
         let checked_stmt = crate::types::check_statement(&checked, &stmt, &self.bindings)?;
         let typed_stmt = crate::tir::lower_statement(&checked, &stmt, &checked_stmt)?;
         let lowered = crate::tir::lower_module(&checked)?;
-        let interpreter = crate::runtime::Interpreter::new(&lowered)?;
+        let interpreter = crate::runtime::Interpreter::new_with_mode(&lowered, self.mode)?;
         interpreter.execute_repl_statement(&typed_stmt, &mut self.values)?;
 
         if let Some((name, binding)) = checked_stmt.binding {
@@ -163,10 +177,18 @@ pub fn run_repl<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Vec<Diagnostic>> {
+    run_repl_with_mode(input, output, ExecutionMode::Tooling)
+}
+
+pub fn run_repl_with_mode<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    mode: ExecutionMode,
+) -> Result<(), Vec<Diagnostic>> {
     writeln!(output, "vulgata repl").map_err(io_diag)?;
     writeln!(output, "type :help for commands").map_err(io_diag)?;
 
-    let mut session = ReplSession::new();
+    let mut session = ReplSession::with_mode(mode);
     let mut pending = Vec::new();
     let mut line = String::new();
 
@@ -228,11 +250,15 @@ pub fn run_repl<R: BufRead, W: Write>(
 }
 
 pub fn run_repl_terminal() -> Result<(), Vec<Diagnostic>> {
+    run_repl_terminal_with_mode(ExecutionMode::Tooling)
+}
+
+pub fn run_repl_terminal_with_mode(mode: ExecutionMode) -> Result<(), Vec<Diagnostic>> {
     let mut editor = DefaultEditor::new().map_err(readline_init_diag)?;
     println!("vulgata repl");
     println!("type :help for commands");
 
-    let mut session = ReplSession::new();
+    let mut session = ReplSession::with_mode(mode);
     let mut pending = Vec::new();
 
     loop {

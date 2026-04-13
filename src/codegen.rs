@@ -122,8 +122,11 @@ pub fn lower_module(module: &TypedIrModule) -> Result<RustModule, Vec<Diagnostic
         match decl {
             TypedDecl::Record(record) => {
                 let mut fields = Vec::new();
-                for (name, ty) in &record.fields {
-                    fields.push((name.clone(), lower_storage_type(ty, &record.span)?));
+                for field in &record.fields {
+                    fields.push((
+                        field.name.clone(),
+                        lower_storage_type(&field.ty, &record.span)?,
+                    ));
                 }
                 items.push(RustItem::Struct {
                     name: record.name.clone(),
@@ -280,6 +283,17 @@ fn lower_stmt(
         TypedStmtKind::Return(expr) => RustStmt::Return(expr.as_ref().map(lower_expr).transpose()?),
         TypedStmtKind::Break => RustStmt::Break,
         TypedStmtKind::Continue => RustStmt::Continue,
+        TypedStmtKind::IntentBlock { .. }
+        | TypedStmtKind::ExplainBlock { .. }
+        | TypedStmtKind::StepBlock { .. }
+        | TypedStmtKind::RequiresClause(_)
+        | TypedStmtKind::EnsuresClause(_)
+        | TypedStmtKind::ExampleBlock { .. } => {
+            return Err(vec![codegen_error(
+                &stmt.span,
+                "compile does not yet support semantic-layer constructs",
+            )]);
+        }
         TypedStmtKind::Expect(expr) => {
             if !in_test {
                 return Err(vec![codegen_error(
@@ -367,12 +381,20 @@ fn collect_direct_name_assignments_into(block: &[TypedStmt], names: &mut HashSet
             TypedStmtKind::While { body, .. } | TypedStmtKind::ForEach { body, .. } => {
                 collect_direct_name_assignments_into(body, names);
             }
+            TypedStmtKind::StepBlock { body, .. } => {
+                collect_direct_name_assignments_into(body, names);
+            }
             TypedStmtKind::Let { .. }
             | TypedStmtKind::Var { .. }
             | TypedStmtKind::Assign { .. }
             | TypedStmtKind::Return(_)
             | TypedStmtKind::Break
             | TypedStmtKind::Continue
+            | TypedStmtKind::IntentBlock { .. }
+            | TypedStmtKind::ExplainBlock { .. }
+            | TypedStmtKind::RequiresClause(_)
+            | TypedStmtKind::EnsuresClause(_)
+            | TypedStmtKind::ExampleBlock { .. }
             | TypedStmtKind::Expect(_)
             | TypedStmtKind::Expr(_) => {}
         }

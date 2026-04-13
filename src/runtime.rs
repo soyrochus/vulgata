@@ -66,18 +66,60 @@ pub struct TestResult {
     pub failures: Vec<TestFailure>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Release,
+    Checked,
+    Debug,
+    Tooling,
+}
+
+impl ExecutionMode {
+    pub fn parse_cli(value: &str) -> Option<Self> {
+        match value {
+            "release" => Some(Self::Release),
+            "checked" => Some(Self::Checked),
+            "debug" => Some(Self::Debug),
+            "tooling" => Some(Self::Tooling),
+            _ => None,
+        }
+    }
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Checked => "checked",
+            Self::Debug => "debug",
+            Self::Tooling => "tooling",
+        }
+    }
+
+    fn enforces_checkable(self) -> bool {
+        matches!(self, Self::Checked | Self::Debug)
+    }
+}
+
 pub struct Interpreter<'a> {
     module: &'a TypedIrModule,
     actions: HashMap<&'a str, &'a crate::tir::TypedActionDecl>,
     tests: Vec<&'a crate::tir::TypedTestDecl>,
     globals: HashMap<String, Value>,
     externs: ExternRegistry,
+    pub mode: ExecutionMode,
 }
 
 impl<'a> Interpreter<'a> {
     pub fn new(module: &'a TypedIrModule) -> Result<Self, Vec<Diagnostic>> {
         let externs = ExternRegistry::from_module(module)?;
-        Self::with_externs(module, externs)
+        Self::with_externs_and_mode(module, externs, ExecutionMode::Checked)
+    }
+
+    pub fn new_with_mode(
+        module: &'a TypedIrModule,
+        mode: ExecutionMode,
+    ) -> Result<Self, Vec<Diagnostic>> {
+        let externs = ExternRegistry::from_module(module)?;
+        Self::with_externs_and_mode(module, externs, mode)
     }
 
     pub fn from_path(
@@ -85,12 +127,29 @@ impl<'a> Interpreter<'a> {
         externs_path: &Path,
     ) -> Result<Self, Vec<Diagnostic>> {
         let externs = ExternRegistry::from_path(module, externs_path)?;
-        Self::with_externs(module, externs)
+        Self::with_externs_and_mode(module, externs, ExecutionMode::Checked)
+    }
+
+    pub fn from_path_with_mode(
+        module: &'a TypedIrModule,
+        externs_path: &Path,
+        mode: ExecutionMode,
+    ) -> Result<Self, Vec<Diagnostic>> {
+        let externs = ExternRegistry::from_path(module, externs_path)?;
+        Self::with_externs_and_mode(module, externs, mode)
     }
 
     pub fn with_externs(
         module: &'a TypedIrModule,
         externs: ExternRegistry,
+    ) -> Result<Self, Vec<Diagnostic>> {
+        Self::with_externs_and_mode(module, externs, ExecutionMode::Checked)
+    }
+
+    pub fn with_externs_and_mode(
+        module: &'a TypedIrModule,
+        externs: ExternRegistry,
+        mode: ExecutionMode,
     ) -> Result<Self, Vec<Diagnostic>> {
         let mut actions = HashMap::new();
         let mut tests = Vec::new();
@@ -116,6 +175,7 @@ impl<'a> Interpreter<'a> {
             tests,
             globals,
             externs,
+            mode,
         })
     }
 
@@ -142,7 +202,7 @@ impl<'a> Interpreter<'a> {
         for test_decl in &self.tests {
             let mut env = self.globals.clone();
             let mut failures = Vec::new();
-            let flow = self.execute_block(&test_decl.body, &mut env, &mut failures)?;
+            let flow = self.execute_block(&test_decl.body, &mut env, &mut failures, true)?;
             if !matches!(flow, ExecFlow::Continue) {
                 return Err(vec![runtime_error(
                     &test_decl.span,
@@ -178,7 +238,7 @@ impl<'a> Interpreter<'a> {
         env: &mut HashMap<String, Value>,
     ) -> Result<(), Vec<Diagnostic>> {
         let mut failures = Vec::new();
-        match self.execute_stmt(stmt, env, &mut failures)? {
+        match self.execute_stmt(stmt, env, &mut failures, false)? {
             ExecFlow::Continue => Ok(()),
             ExecFlow::Return(_) | ExecFlow::Break | ExecFlow::ContinueLoop => {
                 Err(vec![runtime_error(
@@ -190,6 +250,21 @@ impl<'a> Interpreter<'a> {
     }
 
     fn call_action(&self, name: &str, args: Vec<Value>) -> Result<Value, Vec<Diagnostic>> {
+        self.call_action_with_options(
+            name,
+            args,
+            CallOptions {
+                run_examples: true,
+            },
+        )
+    }
+
+    fn call_action_with_options(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+        options: CallOptions,
+    ) -> Result<Value, Vec<Diagnostic>> {
         if let Some(action) = standard_runtime::lookup_standard_runtime_name(name) {
             return self.call_standard_runtime(action, args, &self.module.span);
         }
@@ -220,14 +295,27 @@ impl<'a> Interpreter<'a> {
             env.insert(param_name.clone(), value);
         }
 
-        match self.execute_block(&action.body, &mut env, &mut Vec::new())? {
-            ExecFlow::Continue => Ok(Value::None),
-            ExecFlow::Return(value) => Ok(value),
+        if self.mode.enforces_checkable() {
+            self.evaluate_requires(action, &mut env)?;
+        }
+
+        let result = match self.execute_block(&action.body, &mut env, &mut Vec::new(), false)? {
+            ExecFlow::Continue => Value::None,
+            ExecFlow::Return(value) => value,
             ExecFlow::Break | ExecFlow::ContinueLoop => Err(vec![runtime_error(
                 &action.span,
                 "break/continue escaped its loop boundary",
-            )]),
+            )])?,
+        };
+
+        if self.mode.enforces_checkable() {
+            self.evaluate_ensures(action, &env, &result)?;
+            if options.run_examples {
+                self.evaluate_examples(action)?;
+            }
         }
+
+        Ok(result)
     }
 
     fn execute_block(
@@ -235,9 +323,10 @@ impl<'a> Interpreter<'a> {
         block: &[TypedStmt],
         env: &mut HashMap<String, Value>,
         failures: &mut Vec<TestFailure>,
+        in_test: bool,
     ) -> Result<ExecFlow, Vec<Diagnostic>> {
         for stmt in block {
-            match self.execute_stmt(stmt, env, failures)? {
+            match self.execute_stmt(stmt, env, failures, in_test)? {
                 ExecFlow::Continue => {}
                 flow => return Ok(flow),
             }
@@ -250,8 +339,21 @@ impl<'a> Interpreter<'a> {
         stmt: &TypedStmt,
         env: &mut HashMap<String, Value>,
         failures: &mut Vec<TestFailure>,
+        in_test: bool,
     ) -> Result<ExecFlow, Vec<Diagnostic>> {
         match &stmt.kind {
+            TypedStmtKind::IntentBlock { .. } | TypedStmtKind::ExplainBlock { .. } => {
+                Ok(ExecFlow::Continue)
+            }
+            TypedStmtKind::StepBlock { label, body } => {
+                if self.mode == ExecutionMode::Debug {
+                    eprintln!("{label}");
+                }
+                self.execute_block(body, env, failures, in_test)
+            }
+            TypedStmtKind::RequiresClause(_)
+            | TypedStmtKind::EnsuresClause(_)
+            | TypedStmtKind::ExampleBlock { .. } => Ok(ExecFlow::Continue),
             TypedStmtKind::Let { name, value, .. } => {
                 let evaluated = self.eval_expr(value, env)?;
                 env.insert(name.clone(), evaluated);
@@ -273,14 +375,14 @@ impl<'a> Interpreter<'a> {
             } => {
                 for (condition, body) in branches {
                     if self.eval_expr(condition, env)?.as_bool(&condition.span)? {
-                        return self.execute_block(body, env, failures);
+                        return self.execute_block(body, env, failures, in_test);
                     }
                 }
-                self.execute_block(else_branch, env, failures)
+                self.execute_block(else_branch, env, failures, in_test)
             }
             TypedStmtKind::While { condition, body } => {
                 while self.eval_expr(condition, env)?.as_bool(&condition.span)? {
-                    match self.execute_block(body, env, failures)? {
+                    match self.execute_block(body, env, failures, in_test)? {
                         ExecFlow::Continue => {}
                         ExecFlow::ContinueLoop => continue,
                         ExecFlow::Break => break,
@@ -306,7 +408,7 @@ impl<'a> Interpreter<'a> {
                 };
                 for item in items {
                     env.insert(binding.clone(), item);
-                    match self.execute_block(body, env, failures)? {
+                    match self.execute_block(body, env, failures, in_test)? {
                         ExecFlow::Continue => {}
                         ExecFlow::ContinueLoop => continue,
                         ExecFlow::Break => break,
@@ -324,12 +426,22 @@ impl<'a> Interpreter<'a> {
             TypedStmtKind::Break => Ok(ExecFlow::Break),
             TypedStmtKind::Continue => Ok(ExecFlow::ContinueLoop),
             TypedStmtKind::Expect(expr) => {
+                if !self.mode.enforces_checkable() {
+                    return Ok(ExecFlow::Continue);
+                }
                 let value = self.eval_expr(expr, env)?;
                 if !value.as_bool(&expr.span)? {
-                    failures.push(TestFailure {
-                        span: expr.span.clone(),
-                        message: "expect expression evaluated to false".to_string(),
-                    });
+                    if in_test {
+                        failures.push(TestFailure {
+                            span: expr.span.clone(),
+                            message: "expect expression evaluated to false".to_string(),
+                        });
+                    } else {
+                        return Err(vec![runtime_error(
+                            &expr.span,
+                            "expect expression evaluated to false",
+                        )]);
+                    }
                 }
                 Ok(ExecFlow::Continue)
             }
@@ -338,6 +450,115 @@ impl<'a> Interpreter<'a> {
                 Ok(ExecFlow::Continue)
             }
         }
+    }
+
+    fn evaluate_requires(
+        &self,
+        action: &crate::tir::TypedActionDecl,
+        env: &mut HashMap<String, Value>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for stmt in &action.body {
+            if let TypedStmtKind::RequiresClause(condition) = &stmt.kind {
+                let value = self.eval_expr(condition, env)?;
+                if !value.as_bool(&condition.span)? {
+                    return Err(vec![runtime_error(
+                        &condition.span,
+                        format!(
+                            "requires clause failed: {}",
+                            render_typed_expr(condition)
+                        ),
+                    )]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_ensures(
+        &self,
+        action: &crate::tir::TypedActionDecl,
+        env: &HashMap<String, Value>,
+        result: &Value,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut ensures_env = env.clone();
+        ensures_env.insert("result".to_string(), result.snapshot());
+        for stmt in &action.body {
+            if let TypedStmtKind::EnsuresClause(condition) = &stmt.kind {
+                let value = self.eval_expr(condition, &mut ensures_env)?;
+                if !value.as_bool(&condition.span)? {
+                    return Err(vec![runtime_error(
+                        &condition.span,
+                        format!("ensures clause failed: {}", render_typed_expr(condition)),
+                    )]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn evaluate_examples(
+        &self,
+        action: &crate::tir::TypedActionDecl,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for stmt in &action.body {
+            let TypedStmtKind::ExampleBlock {
+                name,
+                inputs,
+                outputs,
+            } = &stmt.kind
+            else {
+                continue;
+            };
+
+            let mut input_values = HashMap::new();
+            for (input_name, expr) in inputs {
+                input_values.insert(input_name.clone(), self.eval_example_expr(expr)?);
+            }
+
+            let mut args = Vec::new();
+            for (param_name, _) in &action.params {
+                let value = input_values.remove(param_name).ok_or_else(|| {
+                    vec![runtime_error(
+                        &stmt.span,
+                        format!("example `{name}` is missing input `{param_name}`"),
+                    )]
+                })?;
+                args.push(value);
+            }
+
+            if let Some(extra) = input_values.keys().next() {
+                return Err(vec![runtime_error(
+                    &stmt.span,
+                    format!("example `{name}` provides unknown input `{extra}`"),
+                )]);
+            }
+
+            let actual = self.call_action_with_options(
+                &action.name,
+                args,
+                CallOptions {
+                    run_examples: false,
+                },
+            )?;
+
+            for (output_name, expr) in outputs {
+                let expected = self.eval_example_expr(expr)?;
+                if actual != expected {
+                    return Err(vec![runtime_error(
+                        &stmt.span,
+                        format!(
+                            "example `{name}` failed for output `{output_name}`: expected {expected:?}, found {actual:?}",
+                        ),
+                    )]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_example_expr(&self, expr: &TypedExpr) -> Result<Value, Vec<Diagnostic>> {
+        let mut env = self.globals.clone();
+        self.eval_expr(expr, &mut env)
     }
 
     fn eval_expr(
@@ -713,6 +934,11 @@ enum ExecFlow {
     Return(Value),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CallOptions {
+    run_examples: bool,
+}
+
 enum TargetRef {
     Local(String),
     RecordField(Rc<RefCell<BTreeMap<String, Value>>>, String),
@@ -807,6 +1033,90 @@ fn compare_ints(
     }
 }
 
+fn render_typed_expr(expr: &TypedExpr) -> String {
+    match &expr.kind {
+        TypedExprKind::Literal(TypedLiteral::Int(value)) => value.to_string(),
+        TypedExprKind::Literal(TypedLiteral::Dec(value)) => value.clone(),
+        TypedExprKind::Literal(TypedLiteral::String(value)) => format!("{value:?}"),
+        TypedExprKind::Literal(TypedLiteral::Bool(value)) => value.to_string(),
+        TypedExprKind::Literal(TypedLiteral::None) => "none".to_string(),
+        TypedExprKind::Symbol(symbol) => symbol.name.clone(),
+        TypedExprKind::Call { callee, args } => format!(
+            "{}({})",
+            render_typed_expr(callee),
+            args.iter()
+                .map(|arg| render_typed_expr(&arg.expr))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypedExprKind::FieldAccess { base, field } => {
+            format!("{}.{}", render_typed_expr(base), field)
+        }
+        TypedExprKind::Index { base, index } => {
+            format!("{}[{}]", render_typed_expr(base), render_typed_expr(index))
+        }
+        TypedExprKind::Unary { op, expr } => {
+            let op = match op {
+                crate::ast::UnaryOp::Negate => "-",
+                crate::ast::UnaryOp::Not => "not ",
+            };
+            format!("{op}{}", render_typed_expr(expr))
+        }
+        TypedExprKind::Binary { left, op, right } => {
+            format!(
+                "{} {} {}",
+                render_typed_expr(left),
+                render_binary_op(*op),
+                render_typed_expr(right)
+            )
+        }
+        TypedExprKind::List(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(render_typed_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypedExprKind::Map(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    format!("{}: {}", render_typed_expr(key), render_typed_expr(value))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypedExprKind::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(render_typed_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn render_binary_op(op: crate::ast::BinaryOp) -> &'static str {
+    match op {
+        crate::ast::BinaryOp::Add => "+",
+        crate::ast::BinaryOp::Subtract => "-",
+        crate::ast::BinaryOp::Multiply => "*",
+        crate::ast::BinaryOp::Divide => "/",
+        crate::ast::BinaryOp::Modulo => "%",
+        crate::ast::BinaryOp::Equal => "==",
+        crate::ast::BinaryOp::NotEqual => "!=",
+        crate::ast::BinaryOp::Less => "<",
+        crate::ast::BinaryOp::LessEqual => "<=",
+        crate::ast::BinaryOp::Greater => ">",
+        crate::ast::BinaryOp::GreaterEqual => ">=",
+        crate::ast::BinaryOp::And => "and",
+        crate::ast::BinaryOp::Or => "or",
+    }
+}
+
 fn runtime_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(span.clone(), Phase::Runtime, message)
 }
@@ -879,13 +1189,14 @@ impl TypedTarget {
 mod tests {
     use std::path::Path;
 
+    use crate::diagnostics::Diagnostic;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::resolver::Resolver;
     use crate::tir::lower_module;
     use crate::types::TypeChecker;
 
-    use super::{Interpreter, Value};
+    use super::{ExecutionMode, Interpreter, Value};
 
     fn lower(source: &str) -> crate::tir::TypedIrModule {
         let path = Path::new("test.vg");
@@ -896,6 +1207,12 @@ mod tests {
             .check()
             .expect("check");
         lower_module(&checked).expect("lower")
+    }
+
+    fn run_with_mode(source: &str, mode: ExecutionMode) -> Result<Value, Vec<Diagnostic>> {
+        let module = lower(source);
+        let interpreter = Interpreter::new_with_mode(&module, mode).expect("interpreter");
+        interpreter.run_main().map(|result| result.value)
     }
 
     #[test]
@@ -1043,6 +1360,141 @@ action main() -> Result[Text, Text]:
             },
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn descriptive_constructs_do_not_change_results_in_any_mode() {
+        let source = r#"
+record Customer:
+  email: Text
+    meaning: "primary address"
+
+action main() -> Int:
+  intent:
+    goal: "return one"
+  explain:
+    "ignore this"
+  step compute:
+    return 1
+"#;
+
+        for mode in [
+            ExecutionMode::Release,
+            ExecutionMode::Checked,
+            ExecutionMode::Debug,
+            ExecutionMode::Tooling,
+        ] {
+            let value = run_with_mode(source, mode).expect("run");
+            assert_eq!(value, Value::Int(1), "mode {}", mode.as_cli_str());
+        }
+    }
+
+    #[test]
+    fn enforces_requires_only_in_checked_and_debug_modes() {
+        let source = r#"
+action main(value: Int) -> Int:
+  requires value > 0
+  return value
+"#;
+
+        let release = {
+            let module = lower(source);
+            let interpreter =
+                Interpreter::new_with_mode(&module, ExecutionMode::Release).expect("interpreter");
+            interpreter
+                .call_action("main", vec![Value::Int(-1)])
+                .expect("release run")
+        };
+        assert_eq!(release, Value::Int(-1));
+
+        let module = lower(source);
+        let interpreter =
+            Interpreter::new_with_mode(&module, ExecutionMode::Checked).expect("interpreter");
+        let diagnostics = interpreter
+            .call_action("main", vec![Value::Int(-1)])
+            .expect_err("checked run should fail");
+        assert!(diagnostics[0].message.contains("requires clause failed"));
+    }
+
+    #[test]
+    fn enforces_ensures_with_result_binding() {
+        let source = r#"
+action main() -> Int:
+  ensures result > 0
+  return 0
+"#;
+
+        let module = lower(source);
+        let interpreter =
+            Interpreter::new_with_mode(&module, ExecutionMode::Checked).expect("interpreter");
+        let diagnostics = interpreter.run_main().expect_err("checked run should fail");
+        assert!(diagnostics[0].message.contains("ensures clause failed"));
+    }
+
+    #[test]
+    fn executes_example_blocks_in_checked_mode_and_skips_them_in_release() {
+        let source = r#"
+action main(value: Int) -> Int:
+  example passing:
+    input:
+      value = 2
+    output:
+      result = 2
+  return value
+"#;
+
+        let checked = {
+            let module = lower(source);
+            let interpreter =
+                Interpreter::new_with_mode(&module, ExecutionMode::Checked).expect("interpreter");
+            interpreter
+                .call_action("main", vec![Value::Int(1)])
+                .expect("checked example should pass")
+        };
+        assert_eq!(checked, Value::Int(1));
+
+        let release = {
+            let module = lower(source);
+            let interpreter =
+                Interpreter::new_with_mode(&module, ExecutionMode::Release).expect("interpreter");
+            interpreter
+                .call_action("main", vec![Value::Int(1)])
+                .expect("release example should be skipped")
+        };
+        assert_eq!(release, Value::Int(1));
+    }
+
+    #[test]
+    fn reports_failing_examples() {
+        let source = r#"
+action main(value: Int) -> Int:
+  example failing:
+    input:
+      value = 2
+    output:
+      result = 3
+  return value
+"#;
+
+        let module = lower(source);
+        let interpreter =
+            Interpreter::new_with_mode(&module, ExecutionMode::Checked).expect("interpreter");
+        let diagnostics = interpreter
+            .call_action("main", vec![Value::Int(1)])
+            .expect_err("example should fail");
+        assert!(diagnostics[0].message.contains("example `failing` failed"));
+    }
+
+    #[test]
+    fn skips_action_expects_in_release_mode() {
+        let source = r#"
+action main() -> Int:
+  expect false
+  return 1
+"#;
+
+        let release = run_with_mode(source, ExecutionMode::Release).expect("release run");
+        assert_eq!(release, Value::Int(1));
     }
 }
 
