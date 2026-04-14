@@ -37,6 +37,14 @@ Version 0.5 keeps the v0.4 mutability model and the implemented `console`, `file
 * four execution modes: `release`, `checked`, `debug`, and `tooling`
 * optional JSON metadata export through `--emit-metadata`
 
+Version 0.5 also includes a first phase of richer value handling and structural control flow:
+
+* statement-form `match`
+* phase-1 match patterns: wildcard, literals, bindings, tuple patterns, nominal record patterns, and enum-style variant patterns
+* tuple and nominal-record destructuring in `let` and `var`
+* built-in `Result[T, E]` operations: `is_ok()`, `is_err()`, `value()`, `error()`
+* built-in `Option[T]` operations: `is_some()`, `is_none()`, `value()`
+
 The semantic-layer additions are specified as source-language features even where backend parity is still being hardened in the reference implementation.
 
 ## 2. Design goals

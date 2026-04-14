@@ -104,16 +104,18 @@ The full language reference is now split into a small set of spec documents:
 
 What follows is still just a short taste.
 
+The current v0.6 surface includes built-in `Result`/`Option` member operations, statement-form `match`, and phase-1 tuple/record destructuring in declarations.
+
 ### Hello, Vulgata
 
 Save this as `hello.vg`:
 
 ```text
-action greet(name: Text) -> Text:
-  return "Hello, " + name + "!"
+action greet_world() -> Text:
+  return "Hello, world!"
 
 action main() -> Text:
-  return greet("world")
+  return greet_world()
 ```
 
 Run it:
@@ -129,7 +131,7 @@ The initial standard runtime library exposes `console` and `file` as ordinary mo
 
 ```text
 action main() -> Bool:
-  let _ = console.println("Checking whether README.md exists...")
+  let printed = console.println("Checking whether README.md exists...")
   return file.exists("README.md")
 ```
 
@@ -159,9 +161,44 @@ action countdown(n: Int) -> Int:
   return total
 ```
 
+### Result, Option, match, and destructuring
+
+`Result[T, E]` and `Option[T]` expose built-in member operations with no import:
+
+```text
+action choose_name(result: Result[Text, Text], fallback: Option[Text]) -> Text:
+  if result.is_ok():
+    return result.value()
+  if fallback.is_some():
+    return fallback.value()
+  return result.error()
+```
+
+Statement-form `match` handles variants, tuples, and records, while declaration destructuring stays narrower:
+
+```text
+record Customer:
+  name: Text
+  active: Bool
+
+action score(pair: (Int, Int), customer: Customer, result: Result[Int, Text]) -> Int:
+  let (left, right) = pair
+  let Customer(active: active) = customer
+
+  match result:
+    Ok(value):
+      if active:
+        return value + left + right
+      return value
+    Err(_):
+      return 0
+```
+
+In phase 1, declaration destructuring supports tuple and nominal record forms only. Wildcards, nested patterns, enum destructuring in `let`/`var`, and destructuring in `:=` are rejected.
+
 ### Intent, contracts, and execution modes
 
-Vulgata v0.5 also has a first semantic layer system. Some constructs are descriptive only, and some are checkable depending on the active mode:
+Vulgata v0.6 also has a first semantic layer system. Some constructs are descriptive only, and some are checkable depending on the active mode:
 
 ```text
 action normalize(value: Int) -> Int:

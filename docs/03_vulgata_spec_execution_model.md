@@ -243,8 +243,6 @@ Candidate modules:
 * `map`
 * `set`
 * `time`
-* `result`
-* `option`
 * `test`
 * `console`
 * `file`
@@ -254,10 +252,12 @@ For v0.5, the initial implemented standard runtime library remains:
 * `console`
 * `file`
 
+`Result[T, E]` and `Option[T]` inspection/extraction are part of the semantic core, not runtime modules. Their member operations require no import.
+
 Examples:
 
 ```text
-let _ = console.println("hello")
+let printed = console.println("hello")
 let line = console.read_line()
 let data = file.read_text("notes.txt")
 let present = file.exists("config.txt")
@@ -306,16 +306,44 @@ Vulgata does not introduce a dedicated `print` statement. Console and file opera
 
 Do not introduce exceptions as a language-level control-flow system. Use `Result[T, E]` and `Option[T]` explicitly.
 
-### 13.2 Result handling
+### 13.2 Result, Option, and match handling
 
-Without full pattern matching, initial programs may use helper actions:
+`Result[T, E]` exposes built-in member operations:
+
+* `is_ok()`
+* `is_err()`
+* `value()`
+* `error()`
+
+`Option[T]` exposes built-in member operations:
+
+* `is_some()`
+* `is_none()`
+* `value()`
+
+These operations are resolved by the semantic core with no import declaration.
+
+Examples:
 
 ```text
 if result.is_ok():
-  ...
+  return result.value()
+
+if maybe_name.is_none():
+  return "anonymous"
 ```
 
-Long term, controlled `match` may be added.
+Statement-form `match` is also part of the core language and is the canonical branching form for variant-style handling:
+
+```text
+match result:
+  Ok(value):
+    return value
+  Err(message):
+    return message
+```
+
+If no arm matches, execution fails with the named runtime error `NonExhaustiveMatch`.
 
 ### 13.3 Interpreter errors
 
@@ -333,6 +361,10 @@ Named runtime errors should exist for checkable-layer failures such as:
 * failed `requires`
 * failed `ensures`
 * failed `example`
+* `NonExhaustiveMatch`
+* `InvalidResultValueAccess`
+* `InvalidResultErrorAccess`
+* `InvalidOptionValueAccess`
 
 ### 13.4 Compiler errors
 

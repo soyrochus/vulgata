@@ -240,7 +240,7 @@ enum OrderStatus:
   Cancelled(reason: Text)
 ```
 
-Pattern matching is still deferred. Helper actions and predicates may be used instead.
+Enums participate in phase-1 pattern matching through statement-form `match`. Empty variants are matched as `Pending()`-style patterns, and payload variants may bind nested patterns such as `Cancelled(reason)`.
 
 ### 8.4 Actions
 
@@ -293,6 +293,7 @@ Statements in v0.5:
 * conditional
 * `while`
 * `for each`
+* `match`
 * `return`
 * `break`
 * `continue`
@@ -315,6 +316,20 @@ var count: Int = 0
 
 `let` introduces an immutable binding.  
 `var` introduces a mutable binding.
+
+Tuple and nominal-record destructuring are also supported in declarations:
+
+```text
+let (left, right) = pair
+var Customer(name: current_name, active: current_active) = customer
+```
+
+Phase-1 declaration destructuring is intentionally narrower than `match` patterns:
+
+* only tuple and nominal record forms are allowed
+* destructured outputs must be plain identifiers
+* wildcard, nested, and enum-style destructuring are rejected in `let` and `var`
+* destructuring in `:=` is rejected
 
 ### 9.2 Assignment
 
@@ -356,6 +371,18 @@ for each item in items:
 ```
 
 The iterator source must be iterable according to the standard semantics.
+
+Pattern matching:
+
+```text
+match result:
+  Ok(value):
+    return value
+  Err(_):
+    return 0
+```
+
+`match` evaluates the scrutinee once, tests arms in source order, executes the first matching arm, and raises `NonExhaustiveMatch` if no arm matches. Phase-1 patterns include wildcard, literals, bindings, tuple patterns, nominal record patterns, and variant patterns such as `Ok(value)`, `Err(message)`, and `None`.
 
 ### 9.6 Return
 
@@ -480,6 +507,21 @@ Expressions include:
 
 ```text
 customer.email
+```
+
+Certain receiver types also expose built-in member operations resolved by the semantic core rather than by imported modules:
+
+* `Result[T, E]`: `is_ok()`, `is_err()`, `value()`, `error()`
+* `Option[T]`: `is_some()`, `is_none()`, `value()`
+
+Examples:
+
+```text
+if result.is_ok():
+  return result.value()
+
+if maybe_name.is_none():
+  return "anonymous"
 ```
 
 ### 10.2 Indexing
@@ -611,6 +653,7 @@ statement       = intent_stmt
                 | if_stmt
                 | while_stmt
                 | for_stmt
+                | match_stmt
                 | return_stmt
                 | break_stmt
                 | continue_stmt
@@ -643,8 +686,19 @@ example_output  = "output" ":" NEWLINE
                   INDENT { example_binding } DEDENT ;
 example_binding = Identifier "=" literal NEWLINE ;
 
-let_stmt        = "let" Identifier [ ":" type ] "=" expr NEWLINE ;
-var_stmt        = "var" Identifier [ ":" type ] "=" expr NEWLINE ;
+match_stmt      = "match" expr ":" NEWLINE
+                  INDENT { match_arm } DEDENT ;
+match_arm       = pattern ":" NEWLINE
+                  INDENT block DEDENT ;
+
+let_stmt        = "let" binding_pattern [ ":" type ] "=" expr NEWLINE ;
+var_stmt        = "var" binding_pattern [ ":" type ] "=" expr NEWLINE ;
+binding_pattern = Identifier
+                | tuple_binding
+                | record_binding ;
+tuple_binding   = "(" Identifier "," Identifier { "," Identifier } ")" ;
+record_binding  = Identifier "(" record_binding_field { "," record_binding_field } ")" ;
+record_binding_field = Identifier ":" Identifier ;
 
 assign_stmt     = target ":=" expr NEWLINE ;
 target          = Identifier { "." Identifier | "[" expr "]" } ;
@@ -665,6 +719,17 @@ break_stmt      = "break" NEWLINE ;
 continue_stmt   = "continue" NEWLINE ;
 expect_stmt     = "expect" expr NEWLINE ;
 expr_stmt       = expr NEWLINE ;
+
+pattern         = "_"
+                | literal
+                | Identifier
+                | tuple_pattern
+                | named_pattern ;
+tuple_pattern   = "(" pattern "," pattern { "," pattern } ")" ;
+named_pattern   = Identifier "(" [ pattern_items | pattern_fields ] ")" ;
+pattern_items   = pattern { "," pattern } ;
+pattern_fields  = pattern_field { "," pattern_field } ;
+pattern_field   = Identifier ":" pattern ;
 
 expr            = or_expr ;
 or_expr         = and_expr { "or" and_expr } ;

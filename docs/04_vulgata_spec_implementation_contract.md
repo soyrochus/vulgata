@@ -37,8 +37,8 @@ A likely runtime value model:
 * RecordInstance
 * EnumInstance
 * ActionRef
-* Result
-* Option
+* ResultOk / ResultErr
+* OptionSome / OptionNone
 
 The interpreter should avoid embedding language semantics directly in parsing. Semantic phases must remain separate.
 
@@ -220,7 +220,7 @@ The v0.5 reference spec still leaves a few points intentionally explicit:
 ### Phase 5
 
 * richer enums
-* optional pattern matching
+* broader pattern forms beyond the phase-1 `match` subset
 * optimization passes
 * formatter and linter hardening
 
@@ -293,6 +293,7 @@ The reference implementation must support at least the following surface:
 * `if / elif / else`
 * `while`
 * `for each`
+* `match`
 * `return`
 * `break`
 * `continue`
@@ -304,6 +305,14 @@ The reference implementation must support at least the following surface:
 * `ensures`
 * `example`
 * expression statement
+
+### Phase-1 binding and pattern features
+
+* tuple destructuring in `let` and `var`
+* nominal record destructuring in `let` and `var`
+* phase-1 `match` patterns: wildcard, literals, bindings, tuple patterns, nominal record patterns, and enum-style variant patterns
+* built-in `Result[T, E]` member operations: `is_ok()`, `is_err()`, `value()`, `error()`
+* built-in `Option[T]` member operations: `is_some()`, `is_none()`, `value()`
 
 ### Metadata-facing annotations
 
@@ -317,7 +326,7 @@ The reference implementation must support at least the following surface:
 ### Not yet guaranteed across every backend
 
 * semantic-layer code-generation parity
-* pattern matching
+* nested destructuring and broader pattern forms beyond the phase-1 subset
 * closures
 * async semantics
 * macros

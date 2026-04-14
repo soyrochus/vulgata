@@ -351,7 +351,7 @@ enum OrderStatus:
   Cancelled(reason: Text)
 ```
 
-Pattern matching is still deferred. Helper actions and predicates may be used instead.
+Enums participate in phase-1 pattern matching through statement-form `match`. Empty variants are matched as `Pending()`-style patterns, and payload variants may bind nested patterns such as `Cancelled(reason)`.
 
 ### 8.4 Actions
 
@@ -404,6 +404,7 @@ Statements in v0.5:
 * conditional
 * `while`
 * `for each`
+* `match`
 * `return`
 * `break`
 * `continue`
@@ -426,6 +427,20 @@ var count: Int = 0
 
 `let` introduces an immutable binding.  
 `var` introduces a mutable binding.
+
+Tuple and nominal-record destructuring are also supported in declarations:
+
+```text
+let (left, right) = pair
+var Customer(name: current_name, active: current_active) = customer
+```
+
+Phase-1 declaration destructuring is intentionally narrower than `match` patterns:
+
+* only tuple and nominal record forms are allowed
+* destructured outputs must be plain identifiers
+* wildcard, nested, and enum-style destructuring are rejected in `let` and `var`
+* destructuring in `:=` is rejected
 
 ### 9.2 Assignment
 
@@ -467,6 +482,18 @@ for each item in items:
 ```
 
 The iterator source must be iterable according to the standard semantics.
+
+Pattern matching:
+
+```text
+match result:
+  Ok(value):
+    return value
+  Err(_):
+    return 0
+```
+
+`match` evaluates the scrutinee once, tests arms in source order, executes the first matching arm, and raises `NonExhaustiveMatch` if no arm matches. Phase-1 patterns include wildcard, literals, bindings, tuple patterns, nominal record patterns, and variant patterns such as `Ok(value)`, `Err(message)`, and `None`.
 
 ### 9.6 Return
 
@@ -591,6 +618,21 @@ Expressions include:
 
 ```text
 customer.email
+```
+
+Certain receiver types also expose built-in member operations resolved by the semantic core rather than by imported modules:
+
+* `Result[T, E]`: `is_ok()`, `is_err()`, `value()`, `error()`
+* `Option[T]`: `is_some()`, `is_none()`, `value()`
+
+Examples:
+
+```text
+if result.is_ok():
+  return result.value()
+
+if maybe_name.is_none():
+  return "anonymous"
 ```
 
 ### 10.2 Indexing
@@ -722,6 +764,7 @@ statement       = intent_stmt
                 | if_stmt
                 | while_stmt
                 | for_stmt
+                | match_stmt
                 | return_stmt
                 | break_stmt
                 | continue_stmt
@@ -754,8 +797,19 @@ example_output  = "output" ":" NEWLINE
                   INDENT { example_binding } DEDENT ;
 example_binding = Identifier "=" literal NEWLINE ;
 
-let_stmt        = "let" Identifier [ ":" type ] "=" expr NEWLINE ;
-var_stmt        = "var" Identifier [ ":" type ] "=" expr NEWLINE ;
+match_stmt      = "match" expr ":" NEWLINE
+                  INDENT { match_arm } DEDENT ;
+match_arm       = pattern ":" NEWLINE
+                  INDENT block DEDENT ;
+
+let_stmt        = "let" binding_pattern [ ":" type ] "=" expr NEWLINE ;
+var_stmt        = "var" binding_pattern [ ":" type ] "=" expr NEWLINE ;
+binding_pattern = Identifier
+                | tuple_binding
+                | record_binding ;
+tuple_binding   = "(" Identifier "," Identifier { "," Identifier } ")" ;
+record_binding  = Identifier "(" record_binding_field { "," record_binding_field } ")" ;
+record_binding_field = Identifier ":" Identifier ;
 
 assign_stmt     = target ":=" expr NEWLINE ;
 target          = Identifier { "." Identifier | "[" expr "]" } ;
@@ -776,6 +830,17 @@ break_stmt      = "break" NEWLINE ;
 continue_stmt   = "continue" NEWLINE ;
 expect_stmt     = "expect" expr NEWLINE ;
 expr_stmt       = expr NEWLINE ;
+
+pattern         = "_"
+                | literal
+                | Identifier
+                | tuple_pattern
+                | named_pattern ;
+tuple_pattern   = "(" pattern "," pattern { "," pattern } ")" ;
+named_pattern   = Identifier "(" [ pattern_items | pattern_fields ] ")" ;
+pattern_items   = pattern { "," pattern } ;
+pattern_fields  = pattern_field { "," pattern_field } ;
+pattern_field   = Identifier ":" pattern ;
 
 expr            = or_expr ;
 or_expr         = and_expr { "or" and_expr } ;
@@ -1069,8 +1134,6 @@ Candidate modules:
 * `map`
 * `set`
 * `time`
-* `result`
-* `option`
 * `test`
 * `console`
 * `file`
@@ -1080,10 +1143,12 @@ For v0.5, the initial implemented standard runtime library remains:
 * `console`
 * `file`
 
+`Result[T, E]` and `Option[T]` inspection/extraction are part of the semantic core, not runtime modules. Their member operations require no import.
+
 Examples:
 
 ```text
-let _ = console.println("hello")
+let printed = console.println("hello")
 let line = console.read_line()
 let data = file.read_text("notes.txt")
 let present = file.exists("config.txt")
@@ -1132,16 +1197,44 @@ Vulgata does not introduce a dedicated `print` statement. Console and file opera
 
 Do not introduce exceptions as a language-level control-flow system. Use `Result[T, E]` and `Option[T]` explicitly.
 
-### 13.2 Result handling
+### 13.2 Result, Option, and match handling
 
-Without full pattern matching, initial programs may use helper actions:
+`Result[T, E]` exposes built-in member operations:
+
+* `is_ok()`
+* `is_err()`
+* `value()`
+* `error()`
+
+`Option[T]` exposes built-in member operations:
+
+* `is_some()`
+* `is_none()`
+* `value()`
+
+These operations are resolved by the semantic core with no import declaration.
+
+Examples:
 
 ```text
 if result.is_ok():
-  ...
+  return result.value()
+
+if maybe_name.is_none():
+  return "anonymous"
 ```
 
-Long term, controlled `match` may be added.
+Statement-form `match` is also part of the core language and is the canonical branching form for variant-style handling:
+
+```text
+match result:
+  Ok(value):
+    return value
+  Err(message):
+    return message
+```
+
+If no arm matches, execution fails with the named runtime error `NonExhaustiveMatch`.
 
 ### 13.3 Interpreter errors
 
@@ -1159,6 +1252,10 @@ Named runtime errors should exist for checkable-layer failures such as:
 * failed `requires`
 * failed `ensures`
 * failed `example`
+* `NonExhaustiveMatch`
+* `InvalidResultValueAccess`
+* `InvalidResultErrorAccess`
+* `InvalidOptionValueAccess`
 
 ### 13.4 Compiler errors
 
@@ -1471,7 +1568,7 @@ The v0.5 reference spec still leaves a few points intentionally explicit:
 ### Phase 5
 
 * richer enums
-* optional pattern matching
+* broader pattern forms beyond the phase-1 `match` subset
 * optimization passes
 * formatter and linter hardening
 
@@ -1544,6 +1641,7 @@ The reference implementation must support at least the following surface:
 * `if / elif / else`
 * `while`
 * `for each`
+* `match`
 * `return`
 * `break`
 * `continue`
@@ -1555,6 +1653,14 @@ The reference implementation must support at least the following surface:
 * `ensures`
 * `example`
 * expression statement
+
+### Phase-1 binding and pattern features
+
+* tuple destructuring in `let` and `var`
+* nominal record destructuring in `let` and `var`
+* phase-1 `match` patterns: wildcard, literals, bindings, tuple patterns, nominal record patterns, and enum-style variant patterns
+* built-in `Result[T, E]` member operations: `is_ok()`, `is_err()`, `value()`, `error()`
+* built-in `Option[T]` member operations: `is_some()`, `is_none()`, `value()`
 
 ### Metadata-facing annotations
 
@@ -1568,7 +1674,7 @@ The reference implementation must support at least the following surface:
 ### Not yet guaranteed across every backend
 
 * semantic-layer code-generation parity
-* pattern matching
+* nested destructuring and broader pattern forms beyond the phase-1 subset
 * closures
 * async semantics
 * macros
