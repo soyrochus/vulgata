@@ -45,11 +45,22 @@ vscode-extension/
   CHANGELOG.md
 ```
 
-## Quick Local Check
+## Permanent Local Install (No Packaging Required)
 
-To test the extension locally:
+The quickest way to get syntax highlighting in every workspace is to symlink the extension folder into VS Code's extensions directory:
 
-1. Open `syntax/vscode-extension` in VS Code.
+```sh
+ln -s /path/to/vulgata/syntax/vscode-extension \
+  ~/.vscode/extensions/vulgata-language
+```
+
+Restart VS Code once. The extension will be active globally, and because it is a symlink any edits to the grammar or configuration take effect on the next window reload — no reinstall needed.
+
+## Quick Local Check (Development Host)
+
+To test without a permanent install:
+
+1. Open `syntax/vscode-extension` as the VS Code workspace root — either via **File → Open Folder…** or `code syntax/vscode-extension` from the terminal.
 2. Press `F5` to launch an Extension Development Host.
 3. In the new window, open a `.vg` file such as `examples/sort.vg`.
 4. Confirm that declaration heads, semantic-layer keywords, strings, numbers, comments, and operators like `:=` are colored distinctly.
