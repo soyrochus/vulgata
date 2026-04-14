@@ -216,6 +216,10 @@ pub enum StmtKind {
         condition: Expr,
         body: Vec<Stmt>,
     },
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+    },
     ForEach {
         binding: String,
         iterable: Expr,
@@ -232,6 +236,51 @@ pub enum StmtKind {
 pub struct ConditionalBranch {
     pub condition: Expr,
     pub body: Vec<Stmt>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Vec<Stmt>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternKind {
+    Wildcard,
+    Literal(PatternLiteral),
+    Binding(String),
+    Variant {
+        name: String,
+        args: Vec<Pattern>,
+    },
+    Tuple(Vec<Pattern>),
+    Record {
+        name: String,
+        fields: Vec<RecordPatternField>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatternLiteral {
+    Int(i64),
+    Dec(String),
+    String(String),
+    Bool(bool),
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordPatternField {
+    pub name: String,
+    pub pattern: Pattern,
     pub span: SourceSpan,
 }
 

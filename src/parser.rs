@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::{
     ActionDecl, AstModule, BinaryOp, CallArg, ConditionalBranch, ConstDecl, Decl, EnumDecl,
-    EnumVariant, Expr, ExprKind, ExternDecl, FieldDecl, ImportDecl, ImportKind, ModuleDecl,
-    ModuleName, NodeId, Param, Purity, RecordDecl, Stmt, StmtKind, Target, TestDecl, TypeRef,
-    UnaryOp, VariantField,
+    EnumVariant, Expr, ExprKind, ExternDecl, FieldDecl, ImportDecl, ImportKind, MatchArm,
+    ModuleDecl, ModuleName, NodeId, Param, Pattern, PatternKind, PatternLiteral, Purity,
+    RecordDecl, RecordPatternField, Stmt, StmtKind, Target, TestDecl, TypeRef, UnaryOp,
+    VariantField,
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::lexer::{SpannedToken, Token};
@@ -354,6 +355,7 @@ impl Parser {
             Token::Var => self.parse_var_stmt()?,
             Token::If => self.parse_if_stmt()?,
             Token::While => self.parse_while_stmt()?,
+            Token::Match => self.parse_match_stmt()?,
             Token::For => self.parse_for_stmt()?,
             Token::Return => self.parse_return_stmt()?,
             Token::Break => {
@@ -632,6 +634,34 @@ impl Parser {
         Ok(StmtKind::While { condition, body })
     }
 
+    fn parse_match_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::Match, "expected `match`")?;
+        let scrutinee = self.parse_expr()?;
+        self.expect_simple(Token::Colon, "expected `:` after match target")?;
+        self.expect_newline("expected newline after match header")?;
+        self.expect_simple(Token::Indent, "expected an indented match body")?;
+
+        let mut arms = Vec::new();
+        while !self.at(&Token::Dedent) && !self.at(&Token::Eof) {
+            let span = self.current_span();
+            let pattern = self.parse_pattern()?;
+            self.expect_simple(Token::Colon, "expected `:` after match pattern")?;
+            self.expect_newline("expected newline after match arm header")?;
+            let body = self.parse_block()?;
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span,
+            });
+        }
+
+        self.expect_simple(Token::Dedent, "expected dedent after match body")?;
+        if arms.is_empty() {
+            return Err(vec![self.error_here("match statement must contain at least one arm")]);
+        }
+        Ok(StmtKind::Match { scrutinee, arms })
+    }
+
     fn parse_for_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
         self.expect_simple(Token::For, "expected `for`")?;
         self.expect_simple(Token::Each, "expected `each` after `for`")?;
@@ -657,6 +687,123 @@ impl Parser {
         };
         self.expect_newline("expected newline after return statement")?;
         Ok(StmtKind::Return(expr))
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, Vec<Diagnostic>> {
+        let span = self.current_span();
+        let kind = match self.current_token() {
+            Token::Identifier(name) if name == "_" => {
+                self.bump();
+                PatternKind::Wildcard
+            }
+            Token::IntLiteral(value) => {
+                let value = *value;
+                self.bump();
+                PatternKind::Literal(PatternLiteral::Int(value))
+            }
+            Token::DecLiteral(value) => {
+                let value = value.clone();
+                self.bump();
+                PatternKind::Literal(PatternLiteral::Dec(value))
+            }
+            Token::StringLiteral(value) => {
+                let value = value.clone();
+                self.bump();
+                PatternKind::Literal(PatternLiteral::String(value))
+            }
+            Token::True => {
+                self.bump();
+                PatternKind::Literal(PatternLiteral::Bool(true))
+            }
+            Token::False => {
+                self.bump();
+                PatternKind::Literal(PatternLiteral::Bool(false))
+            }
+            Token::None => {
+                self.bump();
+                PatternKind::Variant {
+                    name: "None".to_string(),
+                    args: Vec::new(),
+                }
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.bump();
+                if self.at(&Token::LParen) {
+                    self.parse_named_pattern(name)?
+                } else {
+                    PatternKind::Binding(name)
+                }
+            }
+            Token::LParen => self.parse_group_or_tuple_pattern()?,
+            _ => return Err(vec![self.error_here("expected a match pattern")]),
+        };
+        Ok(Pattern { kind, span })
+    }
+
+    fn parse_named_pattern(&mut self, name: String) -> Result<PatternKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::LParen, "expected `(` after pattern name")?;
+        if self.at(&Token::RParen) {
+            self.bump();
+            return Ok(PatternKind::Variant {
+                name,
+                args: Vec::new(),
+            });
+        }
+
+        let is_record_pattern = matches!(
+            (self.current_token(), self.peek_token()),
+            (Token::Identifier(_), Some(token)) if token.same_variant(&Token::Colon)
+        );
+
+        if is_record_pattern {
+            let mut fields = Vec::new();
+            loop {
+                let span = self.current_span();
+                let field_name = self.expect_identifier("expected record pattern field name")?;
+                self.expect_simple(Token::Colon, "expected `:` after record pattern field name")?;
+                let pattern = self.parse_pattern()?;
+                fields.push(RecordPatternField {
+                    name: field_name,
+                    pattern,
+                    span,
+                });
+                if !self.at(&Token::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+            self.expect_simple(Token::RParen, "expected `)` after record pattern")?;
+            Ok(PatternKind::Record { name, fields })
+        } else {
+            let mut args = Vec::new();
+            loop {
+                args.push(self.parse_pattern()?);
+                if !self.at(&Token::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+            self.expect_simple(Token::RParen, "expected `)` after variant pattern")?;
+            Ok(PatternKind::Variant { name, args })
+        }
+    }
+
+    fn parse_group_or_tuple_pattern(&mut self) -> Result<PatternKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::LParen, "expected `(`")?;
+        let first = self.parse_pattern()?;
+        if self.at(&Token::Comma) {
+            let mut items = vec![first];
+            while self.at(&Token::Comma) {
+                self.bump();
+                items.push(self.parse_pattern()?);
+            }
+            self.expect_simple(Token::RParen, "expected `)` after tuple pattern")?;
+            Ok(PatternKind::Tuple(items))
+        } else {
+            self.expect_simple(Token::RParen, "expected `)` after grouped pattern")?;
+            Ok(first.kind)
+        }
     }
 
     fn parse_target(&mut self) -> Result<Target, Vec<Diagnostic>> {
@@ -1407,7 +1554,7 @@ fn expr_is_literal(expr: &Expr) -> bool {
 mod tests {
     use std::path::Path;
 
-    use crate::ast::{Decl, ExprKind, StmtKind, Target};
+    use crate::ast::{Decl, ExprKind, PatternKind, StmtKind, Target};
     use crate::lexer::Lexer;
 
     use super::Parser;
@@ -1549,6 +1696,50 @@ action main(value: Int) -> Int:
                 assert!(matches!(action.body[4].kind, StmtKind::EnsuresClause { .. }));
                 assert!(matches!(action.body[5].kind, StmtKind::ExampleBlock { .. }));
             }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_match_statements_with_variant_and_record_patterns() {
+        let module = parse(
+            r#"
+record Customer:
+  name: Text
+  active: Bool
+
+action main(result: Result[Customer, Text]) -> Text:
+  match result:
+    Ok(Customer(name: n, active: true)):
+      return n
+    Err(message):
+      return message
+"#,
+        );
+
+        match &module.declarations[1] {
+            Decl::Action(action) => match &action.body[0].kind {
+                StmtKind::Match { arms, .. } => {
+                    assert_eq!(arms.len(), 2);
+                    match &arms[0].pattern.kind {
+                        PatternKind::Variant { name, args } => {
+                            assert_eq!(name, "Ok");
+                            assert_eq!(args.len(), 1);
+                            assert!(matches!(args[0].kind, PatternKind::Record { .. }));
+                        }
+                        other => panic!("unexpected first arm pattern: {other:?}"),
+                    }
+                    match &arms[1].pattern.kind {
+                        PatternKind::Variant { name, args } => {
+                            assert_eq!(name, "Err");
+                            assert_eq!(args.len(), 1);
+                            assert!(matches!(args[0].kind, PatternKind::Binding(_)));
+                        }
+                        other => panic!("unexpected second arm pattern: {other:?}"),
+                    }
+                }
+                other => panic!("unexpected statement: {other:?}"),
+            },
             other => panic!("unexpected declaration: {other:?}"),
         }
     }

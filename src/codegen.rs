@@ -5,8 +5,8 @@ use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
 use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
-    TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
-    TypedStmtKind, TypedSymbol, TypedTarget,
+    TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedMatchArm,
+    TypedPattern, TypedPatternKind, TypedStmt, TypedStmtKind, TypedSymbol, TypedTarget,
 };
 use crate::types::Type;
 
@@ -25,7 +25,7 @@ pub enum RustItem {
     },
     Enum {
         name: String,
-        variants: Vec<String>,
+        variants: Vec<RustEnumVariant>,
     },
     Function {
         name: String,
@@ -41,6 +41,12 @@ pub struct RustParam {
     pub name: String,
     pub ty: RustType,
     pub mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RustEnumVariant {
+    pub name: String,
+    pub fields: Vec<(String, RustType)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,7 +142,25 @@ pub fn lower_module(module: &TypedIrModule) -> Result<RustModule, Vec<Diagnostic
             TypedDecl::Enum(enum_decl) => {
                 items.push(RustItem::Enum {
                     name: enum_decl.name.clone(),
-                    variants: enum_decl.variants.clone(),
+                    variants: enum_decl
+                        .variants
+                        .iter()
+                        .map(|variant| {
+                            Ok(RustEnumVariant {
+                                name: variant.name.clone(),
+                                fields: variant
+                                    .fields
+                                    .iter()
+                                    .map(|(field_name, field_ty)| {
+                                        Ok((
+                                            field_name.clone(),
+                                            lower_storage_type(field_ty, &enum_decl.span)?,
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
                 });
             }
             TypedDecl::Const(const_decl) => {
@@ -277,6 +301,9 @@ fn lower_stmt(
             condition: lower_expr(condition)?,
             body: lower_block(body, in_test, reassigned, return_type)?,
         },
+        TypedStmtKind::Match { scrutinee, arms } => {
+            lower_match_stmt(scrutinee, arms, in_test, reassigned, return_type)?
+        }
         TypedStmtKind::ForEach {
             binding,
             iterable,
@@ -399,6 +426,11 @@ fn collect_direct_name_assignments_into(block: &[TypedStmt], names: &mut HashSet
             TypedStmtKind::While { body, .. } | TypedStmtKind::ForEach { body, .. } => {
                 collect_direct_name_assignments_into(body, names);
             }
+            TypedStmtKind::Match { arms, .. } => {
+                for arm in arms {
+                    collect_direct_name_assignments_into(&arm.body, names);
+                }
+            }
             TypedStmtKind::StepBlock { body, .. } => {
                 collect_direct_name_assignments_into(body, names);
             }
@@ -417,6 +449,32 @@ fn collect_direct_name_assignments_into(block: &[TypedStmt], names: &mut HashSet
             | TypedStmtKind::Expr(_) => {}
         }
     }
+}
+
+fn lower_match_stmt(
+    scrutinee: &TypedExpr,
+    arms: &[TypedMatchArm],
+    in_test: bool,
+    reassigned: &HashSet<String>,
+    return_type: &Type,
+) -> Result<RustStmt, Vec<Diagnostic>> {
+    let scrutinee_expr = render_expr(&lower_expr(scrutinee)?);
+    let mut lines = vec![format!("match {scrutinee_expr} {{")];
+    for arm in arms {
+        let pattern = render_pattern(&arm.pattern)?;
+        lines.push(format!("    {pattern} => {{"));
+        for stmt in lower_block(&arm.body, in_test, reassigned, return_type)? {
+            let mut rendered = String::new();
+            render_stmt(&stmt, 2, &mut rendered);
+            for line in rendered.lines() {
+                lines.push(line.to_string());
+            }
+        }
+        lines.push("    },".to_string());
+    }
+    lines.push("    _ => panic!(\"NonExhaustiveMatch\"),".to_string());
+    lines.push("}".to_string());
+    Ok(RustStmt::Raw(lines.join("\n")))
 }
 
 fn lower_assignment(target: &TypedTarget, value: &TypedExpr) -> Result<RustStmt, Vec<Diagnostic>> {
@@ -486,6 +544,12 @@ fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
     match &expr.kind {
         TypedExprKind::Literal(literal) => Ok(lower_literal(literal)),
         TypedExprKind::Symbol(symbol) => lower_symbol(symbol, &expr.ty, &expr.span),
+        TypedExprKind::VariantConstructor {
+            type_name,
+            variant_name,
+            field_names,
+            args,
+        } => lower_variant_constructor(type_name, variant_name, field_names, args),
         TypedExprKind::Call { callee, args } => lower_call(callee, args, expr),
         TypedExprKind::FieldAccess { base, field } => {
             let base_expr = lower_expr(base)?;
@@ -738,6 +802,40 @@ fn lower_call(
         &expr.span,
         "compile only supports direct calls to records and actions",
     )])
+}
+
+fn lower_variant_constructor(
+    type_name: &str,
+    variant_name: &str,
+    field_names: &[String],
+    args: &[TypedExpr],
+) -> Result<RustExpr, Vec<Diagnostic>> {
+    let rendered_args = args
+        .iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match (type_name, variant_name) {
+        ("Option", "Some") => Ok(RustExpr::raw(format!(
+            "Some({})",
+            render_expr(&rendered_args[0])
+        ))),
+        ("Result", "Ok") | ("Result", "Err") => Ok(RustExpr::raw(format!(
+            "{}({})",
+            variant_name,
+            render_expr(&rendered_args[0])
+        ))),
+        _ if field_names.is_empty() => Ok(RustExpr::raw(format!("{type_name}::{variant_name}"))),
+        _ => Ok(RustExpr::raw(format!(
+            "{type_name}::{variant_name} {{ {} }}",
+            field_names
+                .iter()
+                .zip(rendered_args.iter())
+                .map(|(field_name, arg)| format!("{field_name}: {}", render_expr(arg)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 fn lower_standard_runtime_call(
@@ -1001,7 +1099,19 @@ fn render_item(item: &RustItem, indent: usize, output: &mut String) {
             line(indent, "#[derive(Clone, Debug, PartialEq)]", output);
             line(indent, &format!("enum {name} {{"), output);
             for variant in variants {
-                line(indent + 1, &format!("{variant},"), output);
+                if variant.fields.is_empty() {
+                    line(indent + 1, &format!("{},", variant.name), output);
+                } else {
+                    line(indent + 1, &format!("{} {{", variant.name), output);
+                    for (field, ty) in &variant.fields {
+                        line(
+                            indent + 2,
+                            &format!("{field}: {},", render_type(ty)),
+                            output,
+                        );
+                    }
+                    line(indent + 1, "},", output);
+                }
             }
             line(indent, "}", output);
             line(
@@ -1143,6 +1253,69 @@ fn render_stmt(stmt: &RustStmt, indent: usize, output: &mut String) {
 
 fn render_expr(expr: &RustExpr) -> String {
     render_expr_prec(expr, 0, false)
+}
+
+fn render_pattern(pattern: &TypedPattern) -> Result<String, Vec<Diagnostic>> {
+    match &pattern.kind {
+        TypedPatternKind::Wildcard => Ok("_".to_string()),
+        TypedPatternKind::Literal(literal) => Ok(match literal {
+            TypedLiteral::Int(value) => value.to_string(),
+            TypedLiteral::Dec(value) => value.clone(),
+            TypedLiteral::String(value) => format!("{value:?}"),
+            TypedLiteral::Bool(value) => value.to_string(),
+            TypedLiteral::None => "None".to_string(),
+        }),
+        TypedPatternKind::Binding(name) => Ok(name.clone()),
+        TypedPatternKind::Tuple(items) => Ok(format!(
+            "({})",
+            items
+                .iter()
+                .map(render_pattern)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        )),
+        TypedPatternKind::Record { name, fields } => {
+            let rendered_fields = fields
+                .iter()
+                .map(|field| {
+                    render_pattern(&field.pattern).map(|pattern| format!("{}: {}", field.name, pattern))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if rendered_fields.is_empty() {
+                Ok(format!("{name} {{ .. }}"))
+            } else {
+                Ok(format!("{name} {{ {}, .. }}", rendered_fields.join(", ")))
+            }
+        }
+        TypedPatternKind::Variant {
+            type_name,
+            variant_name,
+            field_names,
+            args,
+        } => match (type_name.as_str(), variant_name.as_str()) {
+            ("Option", "Some") | ("Result", "Ok") | ("Result", "Err") => Ok(format!(
+                "{}({})",
+                variant_name,
+                args.iter()
+                    .map(render_pattern)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ")
+            )),
+            ("Option", "None") => Ok("None".to_string()),
+            _ if field_names.is_empty() => Ok(format!("{type_name}::{variant_name}")),
+            _ => Ok(format!(
+                "{type_name}::{variant_name} {{ {} }}",
+                field_names
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(field_name, arg)| {
+                        render_pattern(arg).map(|pattern| format!("{field_name}: {pattern}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", ")
+            )),
+        },
+    }
 }
 
 fn render_expr_prec(expr: &RustExpr, parent_prec: u8, is_right_child: bool) -> String {
@@ -1702,5 +1875,36 @@ action main() -> Text:
         assert!(emitted.contains("InvalidResultValueAccess"));
         assert!(emitted.contains("InvalidResultErrorAccess"));
         assert!(emitted.contains("match"));
+    }
+
+    #[test]
+    fn emits_match_statements_and_enum_variants() {
+        let module = lower(
+            r#"
+record Customer:
+  name: Text
+
+enum Decision:
+  Accept(reason: Text)
+  Reject
+
+action main() -> Text:
+  let decision = Accept("ok")
+  match decision:
+    Accept(reason):
+      return reason
+    Reject():
+      return "reject"
+"#,
+        );
+
+        let lowered = lower_module(&module).expect("codegen lower");
+        let emitted = emit_module(&lowered);
+
+        assert!(emitted.contains("enum Decision"));
+        assert!(emitted.contains("Accept {"));
+        assert!(emitted.contains("match "));
+        assert!(emitted.contains("Decision::Accept { reason: reason }"));
+        assert!(emitted.contains("panic!(\"NonExhaustiveMatch\")"));
     }
 }

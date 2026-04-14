@@ -210,6 +210,15 @@ fn collect_stmt_metadata(
                 collect_stmt_metadata(stmt, intent, requires, ensures, steps, explain, examples);
             }
         }
+        StmtKind::Match { arms, .. } => {
+            for arm in arms {
+                for stmt in &arm.body {
+                    collect_stmt_metadata(
+                        stmt, intent, requires, ensures, steps, explain, examples,
+                    );
+                }
+            }
+        }
         StmtKind::Let { .. }
         | StmtKind::Var { .. }
         | StmtKind::Assign { .. }

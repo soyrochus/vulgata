@@ -12,7 +12,7 @@ use crate::resolver::SymbolKind;
 use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
     TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
-    TypedStmtKind, TypedSymbol, TypedTarget,
+    TypedMatchArm, TypedPattern, TypedPatternKind, TypedStmtKind, TypedSymbol, TypedTarget,
 };
 use crate::types::Type;
 
@@ -27,6 +27,11 @@ pub enum Value {
     ResultErr(Box<Value>),
     OptionSome(Box<Value>),
     OptionNone,
+    Enum {
+        type_name: String,
+        variant_name: String,
+        fields: Vec<(String, Value)>,
+    },
     Record(Rc<RefCell<BTreeMap<String, Value>>>),
     List(Rc<RefCell<Vec<Value>>>),
     Map(Rc<RefCell<Vec<(Value, Value)>>>),
@@ -45,6 +50,22 @@ impl fmt::Display for Value {
             Value::ResultErr(value) => write!(f, "Err({})", format_result_value(value)),
             Value::OptionSome(value) => write!(f, "Some({})", format_result_value(value)),
             Value::OptionNone => write!(f, "None"),
+            Value::Enum {
+                type_name,
+                variant_name,
+                fields,
+            } => {
+                if fields.is_empty() {
+                    write!(f, "{type_name}::{variant_name}")
+                } else {
+                    let rendered = fields
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    write!(f, "{type_name}::{variant_name}({rendered})")
+                }
+            }
             Value::Record(fields) => write!(f, "Record({:?})", fields.borrow()),
             Value::List(items) => write!(f, "List({:?})", items.borrow()),
             Value::Map(entries) => write!(f, "Map({:?})", entries.borrow()),
@@ -65,6 +86,14 @@ impl fmt::Debug for Value {
             Value::ResultErr(value) => write!(f, "Err({})", format_result_value(value)),
             Value::OptionSome(value) => write!(f, "Some({})", format_result_value(value)),
             Value::OptionNone => write!(f, "None"),
+            Value::Enum {
+                type_name,
+                variant_name,
+                fields,
+            } => f
+                .debug_struct(&format!("{type_name}::{variant_name}"))
+                .field("fields", fields)
+                .finish(),
             Value::Record(fields) => f.debug_tuple("Record").field(&fields.borrow()).finish(),
             Value::List(items) => f.debug_tuple("List").field(&items.borrow()).finish(),
             Value::Map(entries) => f.debug_tuple("Map").field(&entries.borrow()).finish(),
@@ -416,6 +445,26 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(ExecFlow::Continue)
             }
+            TypedStmtKind::Match { scrutinee, arms } => {
+                let scrutinee_value = self.eval_expr(scrutinee, env)?;
+                for arm in arms {
+                    if let Some(bindings) = self.match_arm(arm, &scrutinee_value)? {
+                        let outer_names = env.keys().cloned().collect::<Vec<_>>();
+                        let mut arm_env = env.clone();
+                        for (name, value) in bindings {
+                            arm_env.insert(name, value);
+                        }
+                        let flow = self.execute_block(&arm.body, &mut arm_env, failures, in_test)?;
+                        for name in outer_names {
+                            if let Some(value) = arm_env.get(&name) {
+                                env.insert(name, value.snapshot());
+                            }
+                        }
+                        return Ok(flow);
+                    }
+                }
+                Err(vec![runtime_error(&stmt.span, "NonExhaustiveMatch")])
+            }
             TypedStmtKind::ForEach {
                 binding,
                 iterable,
@@ -584,6 +633,132 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
+    fn match_arm(
+        &self,
+        arm: &TypedMatchArm,
+        value: &Value,
+    ) -> Result<Option<HashMap<String, Value>>, Vec<Diagnostic>> {
+        self.match_pattern(&arm.pattern, value)
+    }
+
+    fn match_pattern(
+        &self,
+        pattern: &TypedPattern,
+        value: &Value,
+    ) -> Result<Option<HashMap<String, Value>>, Vec<Diagnostic>> {
+        match &pattern.kind {
+            TypedPatternKind::Wildcard => Ok(Some(HashMap::new())),
+            TypedPatternKind::Binding(name) => {
+                let mut bindings = HashMap::new();
+                bindings.insert(name.clone(), value.snapshot());
+                Ok(Some(bindings))
+            }
+            TypedPatternKind::Literal(literal) => Ok(if self.literal_matches(literal, value) {
+                Some(HashMap::new())
+            } else {
+                None
+            }),
+            TypedPatternKind::Tuple(items) => match value {
+                Value::List(values) if values.borrow().len() == items.len() => {
+                    let borrowed = values.borrow();
+                    self.match_pattern_sequence(items, &borrowed)
+                }
+                _ => Ok(None),
+            },
+            TypedPatternKind::Record { name, fields } => match value {
+                Value::Record(record_fields) => {
+                    let actual = record_fields.borrow();
+                    let record_type_matches = matches!(&pattern.ty, Type::Record(actual_name) if actual_name == name)
+                        || matches!(pattern.ty, Type::Unknown);
+                    if !record_type_matches {
+                        return Ok(None);
+                    }
+                    let mut bindings = HashMap::new();
+                    for field in fields {
+                        let Some(field_value) = actual.get(&field.name) else {
+                            return Ok(None);
+                        };
+                        let Some(field_bindings) =
+                            self.match_pattern(&field.pattern, field_value)?
+                        else {
+                            return Ok(None);
+                        };
+                        bindings.extend(field_bindings);
+                    }
+                    Ok(Some(bindings))
+                }
+                _ => Ok(None),
+            },
+            TypedPatternKind::Variant {
+                type_name,
+                variant_name,
+                args,
+                ..
+            } => self.match_variant_pattern(type_name, variant_name, args, value),
+        }
+    }
+
+    fn match_pattern_sequence(
+        &self,
+        patterns: &[TypedPattern],
+        values: &[Value],
+    ) -> Result<Option<HashMap<String, Value>>, Vec<Diagnostic>> {
+        let mut bindings = HashMap::new();
+        for (pattern, value) in patterns.iter().zip(values.iter()) {
+            let Some(child_bindings) = self.match_pattern(pattern, value)? else {
+                return Ok(None);
+            };
+            bindings.extend(child_bindings);
+        }
+        Ok(Some(bindings))
+    }
+
+    fn match_variant_pattern(
+        &self,
+        type_name: &str,
+        variant_name: &str,
+        args: &[TypedPattern],
+        value: &Value,
+    ) -> Result<Option<HashMap<String, Value>>, Vec<Diagnostic>> {
+        match (type_name, variant_name, value) {
+            ("Result", "Ok", Value::ResultOk(inner)) => {
+                self.match_pattern_sequence(args, &[inner.as_ref().snapshot()])
+            }
+            ("Result", "Err", Value::ResultErr(inner)) => {
+                self.match_pattern_sequence(args, &[inner.as_ref().snapshot()])
+            }
+            ("Option", "Some", Value::OptionSome(inner)) => {
+                self.match_pattern_sequence(args, &[inner.as_ref().snapshot()])
+            }
+            ("Option", "None", Value::OptionNone) | ("Option", "None", Value::None) => {
+                Ok(Some(HashMap::new()))
+            }
+            (_, expected_variant, Value::Enum {
+                type_name: actual_type,
+                variant_name: actual_variant,
+                fields,
+            }) if actual_type == type_name && actual_variant == expected_variant => {
+                let values = fields
+                    .iter()
+                    .map(|(_, value)| value.snapshot())
+                    .collect::<Vec<_>>();
+                self.match_pattern_sequence(args, &values)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn literal_matches(&self, literal: &TypedLiteral, value: &Value) -> bool {
+        match (literal, value) {
+            (TypedLiteral::Int(expected), Value::Int(actual)) => expected == actual,
+            (TypedLiteral::Dec(expected), Value::Dec(actual)) => expected == actual,
+            (TypedLiteral::String(expected), Value::Text(actual)) => expected == actual,
+            (TypedLiteral::Bool(expected), Value::Bool(actual)) => expected == actual,
+            (TypedLiteral::None, Value::None) | (TypedLiteral::None, Value::OptionNone) => true,
+            _ => false,
+        }
+    }
+
     fn eval_example_expr(&self, expr: &TypedExpr) -> Result<Value, Vec<Diagnostic>> {
         let mut env = self.globals.clone();
         self.eval_expr(expr, &mut env)
@@ -603,6 +778,33 @@ impl<'a> Interpreter<'a> {
                 TypedLiteral::None => Value::None,
             }),
             TypedExprKind::Symbol(symbol) => self.resolve_symbol(symbol, env, &expr.span),
+            TypedExprKind::VariantConstructor {
+                type_name,
+                variant_name,
+                field_names,
+                args,
+            } => {
+                let values = args
+                    .iter()
+                    .map(|arg| self.eval_expr(arg, env))
+                    .collect::<Result<Vec<_>, _>>()?;
+                match (type_name.as_str(), variant_name.as_str()) {
+                    ("Option", "Some") => Ok(Value::OptionSome(Box::new(
+                        values.into_iter().next().unwrap_or(Value::None),
+                    ))),
+                    ("Result", "Ok") => Ok(Value::ResultOk(Box::new(
+                        values.into_iter().next().unwrap_or(Value::None),
+                    ))),
+                    ("Result", "Err") => Ok(Value::ResultErr(Box::new(
+                        values.into_iter().next().unwrap_or(Value::None),
+                    ))),
+                    (_, _) => Ok(Value::Enum {
+                        type_name: type_name.clone(),
+                        variant_name: variant_name.clone(),
+                        fields: field_names.iter().cloned().zip(values).collect(),
+                    }),
+                }
+            }
             TypedExprKind::Call { callee, args } => self.eval_call(callee, args, env, &expr.span),
             TypedExprKind::FieldAccess { base, field } => {
                 let base_value = self.eval_expr(base, env)?;
@@ -1222,6 +1424,16 @@ fn render_typed_expr(expr: &TypedExpr) -> String {
         TypedExprKind::Literal(TypedLiteral::Bool(value)) => value.to_string(),
         TypedExprKind::Literal(TypedLiteral::None) => "none".to_string(),
         TypedExprKind::Symbol(symbol) => symbol.name.clone(),
+        TypedExprKind::VariantConstructor {
+            variant_name, args, ..
+        } => format!(
+            "{}({})",
+            variant_name,
+            args.iter()
+                .map(render_typed_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         TypedExprKind::Call { callee, args } => format!(
             "{}({})",
             render_typed_expr(callee),
@@ -1336,6 +1548,7 @@ fn runtime_variant_name(value: &Value) -> &'static str {
         Value::ResultErr(_) => "Err",
         Value::OptionSome(_) => "Some",
         Value::OptionNone => "None",
+        Value::Enum { .. } => "Enum",
         Value::Record(_) => "Record",
         Value::List(_) => "List",
         Value::Map(_) => "Map",
@@ -1380,6 +1593,18 @@ impl Value {
             Value::ResultErr(value) => Value::ResultErr(Box::new(value.snapshot())),
             Value::OptionSome(value) => Value::OptionSome(Box::new(value.snapshot())),
             Value::OptionNone => Value::OptionNone,
+            Value::Enum {
+                type_name,
+                variant_name,
+                fields,
+            } => Value::Enum {
+                type_name: type_name.clone(),
+                variant_name: variant_name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.snapshot()))
+                    .collect(),
+            },
             Value::Record(fields) => Value::Record(Rc::new(RefCell::new(
                 fields
                     .borrow()
@@ -1778,6 +2003,59 @@ action main() -> Option[Int]:
         )
         .expect("run");
         assert_eq!(none_value, Value::OptionNone);
+    }
+
+    #[test]
+    fn executes_match_statements_over_result_tuple_record_and_enum_values() {
+        let value = run_with_mode(
+            r#"
+record Customer:
+  name: Text
+  active: Bool
+
+enum Decision:
+  Accept(reason: Text)
+  Reject
+
+action main() -> Text:
+  let customer = Customer(name: "Ada", active: true)
+  let pair = ("left", 2)
+  let decision = Accept("ok")
+  match decision:
+    Reject():
+      return "reject"
+    Accept(reason):
+      match pair:
+        (label, count):
+          match customer:
+            Customer(name: n, active: true):
+              match Ok(reason):
+                Ok(message):
+                  return message
+                Err(_):
+                  return "bad"
+  return "fallback"
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(value, Value::Text("ok".to_string()));
+    }
+
+    #[test]
+    fn reports_non_exhaustive_match() {
+        let diagnostics = run_with_mode(
+            r#"
+action main() -> Int:
+  match Err("bad"):
+    Ok(value):
+      return value
+  return 0
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect_err("run should fail");
+        assert!(diagnostics[0].message.contains("NonExhaustiveMatch"));
     }
 
     #[test]

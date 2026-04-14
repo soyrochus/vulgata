@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::ast::{BinaryOp, CallArg, Decl, Expr, ExprKind, Stmt, StmtKind, Target, UnaryOp};
+use crate::ast::{
+    BinaryOp, CallArg, Decl, Expr, ExprKind, Pattern, PatternKind, PatternLiteral,
+    RecordPatternField, Stmt, StmtKind, Target, UnaryOp,
+};
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
 use crate::standard_runtime;
@@ -48,8 +51,14 @@ pub struct TypedRecordField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedEnumDecl {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<TypedEnumVariant>,
     pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedEnumVariant {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +134,10 @@ pub enum TypedStmtKind {
         condition: TypedExpr,
         body: Vec<TypedStmt>,
     },
+    Match {
+        scrutinee: TypedExpr,
+        arms: Vec<TypedMatchArm>,
+    },
     ForEach {
         binding: String,
         iterable: TypedExpr,
@@ -135,6 +148,45 @@ pub enum TypedStmtKind {
     Continue,
     Expect(TypedExpr),
     Expr(TypedExpr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedMatchArm {
+    pub pattern: TypedPattern,
+    pub body: Vec<TypedStmt>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedPattern {
+    pub kind: TypedPatternKind,
+    pub ty: Type,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedPatternKind {
+    Wildcard,
+    Literal(TypedLiteral),
+    Binding(String),
+    Variant {
+        type_name: String,
+        variant_name: String,
+        field_names: Vec<String>,
+        args: Vec<TypedPattern>,
+    },
+    Tuple(Vec<TypedPattern>),
+    Record {
+        name: String,
+        fields: Vec<TypedRecordPatternField>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedRecordPatternField {
+    pub name: String,
+    pub pattern: TypedPattern,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +224,12 @@ pub struct TypedExpr {
 pub enum TypedExprKind {
     Literal(TypedLiteral),
     Symbol(TypedSymbol),
+    VariantConstructor {
+        type_name: String,
+        variant_name: String,
+        field_names: Vec<String>,
+        args: Vec<TypedExpr>,
+    },
     Call {
         callee: Box<TypedExpr>,
         args: Vec<TypedCallArg>,
@@ -313,8 +371,22 @@ fn lower_decl(checked: &CheckedModule, decl: &Decl) -> Result<TypedDecl, Vec<Dia
             variants: enum_decl
                 .variants
                 .iter()
-                .map(|variant| variant.name.clone())
-                .collect(),
+                .map(|variant| {
+                    Ok(TypedEnumVariant {
+                        name: variant.name.clone(),
+                        fields: variant
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                Ok((
+                                    field.name.clone(),
+                                    lower_type_ref(&field.ty, checked, &field.span)?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
             span: enum_decl.span.clone(),
         })),
         Decl::Extern(extern_decl) => {
@@ -472,6 +544,27 @@ fn lower_stmt(checked: &CheckedModule, stmt: &Stmt) -> Result<TypedStmt, Vec<Dia
                 .map(|stmt| lower_stmt(checked, stmt))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        StmtKind::Match { scrutinee, arms } => TypedStmtKind::Match {
+            scrutinee: lower_expr(checked, scrutinee)?,
+            arms: arms
+                .iter()
+                .map(|arm| {
+                    Ok(TypedMatchArm {
+                        pattern: lower_pattern(
+                            checked,
+                            &arm.pattern,
+                            &expr_type(checked, scrutinee)?,
+                        )?,
+                        body: arm
+                            .body
+                            .iter()
+                            .map(|stmt| lower_stmt(checked, stmt))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        span: arm.span.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+        },
         StmtKind::ForEach {
             binding,
             iterable,
@@ -532,6 +625,296 @@ fn lower_target(checked: &CheckedModule, target: &Target) -> Result<TypedTarget,
     }
 }
 
+fn lower_pattern(
+    checked: &CheckedModule,
+    pattern: &Pattern,
+    expected: &Type,
+) -> Result<TypedPattern, Vec<Diagnostic>> {
+    let (kind, ty) = match &pattern.kind {
+        PatternKind::Wildcard => (TypedPatternKind::Wildcard, expected.clone()),
+        PatternKind::Literal(literal) => (
+            TypedPatternKind::Literal(match literal {
+                PatternLiteral::Int(value) => TypedLiteral::Int(*value),
+                PatternLiteral::Dec(value) => TypedLiteral::Dec(value.clone()),
+                PatternLiteral::String(value) => TypedLiteral::String(value.clone()),
+                PatternLiteral::Bool(value) => TypedLiteral::Bool(*value),
+                PatternLiteral::None => TypedLiteral::None,
+            }),
+            expected.clone(),
+        ),
+        PatternKind::Binding(name) => (TypedPatternKind::Binding(name.clone()), expected.clone()),
+        PatternKind::Tuple(items) => {
+            let item_types = match expected {
+                Type::Tuple(types) if types.len() == items.len() => types.clone(),
+                Type::Unknown => vec![Type::Unknown; items.len()],
+                other => {
+                    return Err(vec![Diagnostic::new(
+                        pattern.span.clone(),
+                        Phase::Lower,
+                        format!(
+                            "cannot lower tuple pattern for non-tuple type `{}`",
+                            other.describe()
+                        ),
+                    )]);
+                }
+            };
+            (
+                TypedPatternKind::Tuple(
+                    items
+                        .iter()
+                        .zip(item_types.iter())
+                        .map(|(item, item_ty)| lower_pattern(checked, item, item_ty))
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                expected.clone(),
+            )
+        }
+        PatternKind::Record { name, fields } => (
+            TypedPatternKind::Record {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|field| lower_record_pattern_field(checked, field, name))
+                    .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
+            },
+            Type::Record(name.clone()),
+        ),
+        PatternKind::Variant { name, args } => {
+            let (type_name, field_names, field_types) =
+                lower_pattern_variant_signature(checked, expected, name, &pattern.span)?;
+            (
+                TypedPatternKind::Variant {
+                    type_name: type_name.clone(),
+                    variant_name: name.clone(),
+                    field_names,
+                    args: args
+                        .iter()
+                        .zip(field_types.iter())
+                        .map(|(arg, arg_ty)| lower_pattern(checked, arg, arg_ty))
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
+                type_name_to_type(&type_name, expected),
+            )
+        }
+    };
+
+    Ok(TypedPattern {
+        kind,
+        ty,
+        span: pattern.span.clone(),
+    })
+}
+
+fn lower_record_pattern_field(
+    checked: &CheckedModule,
+    field: &RecordPatternField,
+    record_name: &str,
+) -> Result<TypedRecordPatternField, Vec<Diagnostic>> {
+    let field_type = checked
+        .records
+        .get(record_name)
+        .and_then(|record| record.fields.get(&field.name))
+        .cloned()
+        .unwrap_or(Type::Unknown);
+    Ok(TypedRecordPatternField {
+        name: field.name.clone(),
+        pattern: lower_pattern(checked, &field.pattern, &field_type)?,
+        span: field.span.clone(),
+    })
+}
+
+fn lower_pattern_variant_signature(
+    checked: &CheckedModule,
+    expected: &Type,
+    name: &str,
+    span: &SourceSpan,
+) -> Result<(String, Vec<String>, Vec<Type>), Vec<Diagnostic>> {
+    match (expected, name) {
+        (Type::Result(ok, _), "Ok") => Ok((
+            "Result".to_string(),
+            vec!["value".to_string()],
+            vec![(**ok).clone()],
+        )),
+        (Type::Result(_, err), "Err") => Ok((
+            "Result".to_string(),
+            vec!["error".to_string()],
+            vec![(**err).clone()],
+        )),
+        (Type::Option(inner), "Some") => Ok((
+            "Option".to_string(),
+            vec!["value".to_string()],
+            vec![(**inner).clone()],
+        )),
+        (Type::Option(_), "None") | (Type::None, "None") => {
+            Ok(("Option".to_string(), Vec::new(), Vec::new()))
+        }
+        (Type::Enum(enum_name), variant_name) => {
+            let variant = checked
+                .enums
+                .get(enum_name)
+                .and_then(|enum_type| enum_type.variants.get(variant_name))
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        span.clone(),
+                        Phase::Lower,
+                        format!("unknown enum variant `{variant_name}` for `{enum_name}`"),
+                    )]
+                })?;
+            Ok((
+                enum_name.clone(),
+                variant.fields.iter().map(|(name, _)| name.clone()).collect(),
+                variant.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+            ))
+        }
+        (Type::Unknown, "Ok") => Ok((
+            "Result".to_string(),
+            vec!["value".to_string()],
+            vec![Type::Unknown],
+        )),
+        (Type::Unknown, "Err") => Ok((
+            "Result".to_string(),
+            vec!["error".to_string()],
+            vec![Type::Unknown],
+        )),
+        (Type::Unknown, "Some") => Ok((
+            "Option".to_string(),
+            vec!["value".to_string()],
+            vec![Type::Unknown],
+        )),
+        (Type::Unknown, "None") => Ok(("Option".to_string(), Vec::new(), Vec::new())),
+        (Type::Unknown, variant_name) => {
+            let matches = checked
+                .enums
+                .iter()
+                .filter_map(|(enum_name, enum_type)| {
+                    enum_type
+                        .variants
+                        .get(variant_name)
+                        .map(|variant| (enum_name, variant))
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [(enum_name, variant)] => Ok((
+                    (*enum_name).clone(),
+                    variant.fields.iter().map(|(name, _)| name.clone()).collect(),
+                    variant.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                )),
+                _ => Err(vec![Diagnostic::new(
+                    span.clone(),
+                    Phase::Lower,
+                    format!("ambiguous variant pattern `{variant_name}` during lowering"),
+                )]),
+            }
+        }
+        (other, variant_name) => Err(vec![Diagnostic::new(
+            span.clone(),
+            Phase::Lower,
+            format!(
+                "variant pattern `{variant_name}` cannot be lowered for `{}`",
+                other.describe()
+            ),
+        )]),
+    }
+}
+
+fn type_name_to_type(type_name: &str, expected: &Type) -> Type {
+    match type_name {
+        "Option" => match expected {
+            Type::Option(_) => expected.clone(),
+            _ => Type::Option(Box::new(Type::Unknown)),
+        },
+        "Result" => match expected {
+            Type::Result(_, _) => expected.clone(),
+            _ => Type::Result(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+        },
+        other => Type::Enum(other.to_string()),
+    }
+}
+
+fn lower_zero_arg_variant_constructor(
+    checked: &CheckedModule,
+    expr: &Expr,
+    name: &str,
+) -> Result<Option<TypedExprKind>, Vec<Diagnostic>> {
+    let ty = expr_type(checked, expr)?;
+    match ty {
+        Type::Enum(enum_name) => {
+            let Some(variant) = checked
+                .enums
+                .get(&enum_name)
+                .and_then(|enum_type| enum_type.variants.get(name))
+            else {
+                return Ok(None);
+            };
+            if !variant.fields.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(TypedExprKind::VariantConstructor {
+                type_name: enum_name,
+                variant_name: name.to_string(),
+                field_names: Vec::new(),
+                args: Vec::new(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_variant_constructor_call(
+    checked: &CheckedModule,
+    callee: &Expr,
+    args: &[CallArg],
+) -> Result<Option<TypedExprKind>, Vec<Diagnostic>> {
+    let ExprKind::Name(name) = &callee.kind else {
+        return Ok(None);
+    };
+
+    let lowered_args = args
+        .iter()
+        .map(|arg| lower_expr(checked, &arg.expr))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if name == "Some" {
+        return Ok(Some(TypedExprKind::VariantConstructor {
+            type_name: "Option".to_string(),
+            variant_name: "Some".to_string(),
+            field_names: vec!["value".to_string()],
+            args: lowered_args,
+        }));
+    }
+
+    if name == "Ok" || name == "Err" {
+        return Ok(Some(TypedExprKind::VariantConstructor {
+            type_name: "Result".to_string(),
+            variant_name: name.clone(),
+            field_names: vec![if name == "Ok" {
+                "value".to_string()
+            } else {
+                "error".to_string()
+            }],
+            args: lowered_args,
+        }));
+    }
+
+    let variant_type = checked
+        .enums
+        .iter()
+        .find_map(|(enum_name, enum_type)| {
+            enum_type.variants.get(name).map(|variant| (enum_name, variant))
+        });
+
+    let Some((enum_name, variant)) = variant_type else {
+        return Ok(None);
+    };
+
+    Ok(Some(TypedExprKind::VariantConstructor {
+        type_name: enum_name.clone(),
+        variant_name: name.clone(),
+        field_names: variant.fields.iter().map(|(field, _)| field.clone()).collect(),
+        args: lowered_args,
+    }))
+}
+
 fn lower_expr(checked: &CheckedModule, expr: &Expr) -> Result<TypedExpr, Vec<Diagnostic>> {
     let ty = expr_type(checked, expr)?;
     let kind = match &expr.kind {
@@ -558,18 +941,24 @@ fn lower_expr(checked: &CheckedModule, expr: &Expr) -> Result<TypedExpr, Vec<Dia
                 .map(|item| lower_expr(checked, item))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        ExprKind::Name(name) => TypedExprKind::Symbol(TypedSymbol {
-            name: name.clone(),
-            kind: checked
-                .resolution
-                .symbols
-                .get(name)
-                .map(|symbol| symbol.kind),
-        }),
-        ExprKind::Call { callee, args } => {
-            if let Some(kind) = lower_builtin_result_or_option_call(checked, callee, args)? {
+        ExprKind::Name(name) => {
+            if let Some(kind) = lower_zero_arg_variant_constructor(checked, expr, name)? {
                 kind
-            } else if let Some(kind) = lower_some_constructor_call(checked, callee, args)? {
+            } else {
+                TypedExprKind::Symbol(TypedSymbol {
+                    name: name.clone(),
+                    kind: checked
+                        .resolution
+                        .symbols
+                        .get(name)
+                        .map(|symbol| symbol.kind),
+                })
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            if let Some(kind) = lower_variant_constructor_call(checked, callee, args)? {
+                kind
+            } else if let Some(kind) = lower_builtin_result_or_option_call(checked, callee, args)? {
                 kind
             } else {
                 TypedExprKind::Call {
@@ -657,36 +1046,6 @@ fn lower_builtin_result_or_option_call(
     Ok(Some(kind))
 }
 
-fn lower_some_constructor_call(
-    checked: &CheckedModule,
-    callee: &Expr,
-    args: &[CallArg],
-) -> Result<Option<TypedExprKind>, Vec<Diagnostic>> {
-    let ExprKind::Name(name) = &callee.kind else {
-        return Ok(None);
-    };
-    if name != "Some" {
-        return Ok(None);
-    }
-
-    let args = args
-        .iter()
-        .map(|arg| lower_call_arg(checked, arg))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Some(TypedExprKind::Call {
-        callee: Box::new(TypedExpr {
-            kind: TypedExprKind::Symbol(TypedSymbol {
-                name: "Some".to_string(),
-                kind: None,
-            }),
-            ty: Type::Unknown,
-            span: callee.span.clone(),
-        }),
-        args,
-    }))
-}
-
 enum BuiltinMemberOp {
     ResultIsOk,
     ResultIsErr,
@@ -765,6 +1124,7 @@ fn lower_type_ref(
             "Bytes" => Type::Bytes,
             "None" => Type::None,
             other if checked.records.contains_key(other) => Type::Record(other.to_string()),
+            other if checked.enums.contains_key(other) => Type::Enum(other.to_string()),
             other => {
                 return Err(vec![Diagnostic::new(
                     span.clone(),
@@ -942,6 +1302,44 @@ action option_value() -> Int:
             TypedDecl::Action(action) => match &action.body[1].kind {
                 TypedStmtKind::Return(Some(expr)) => {
                     assert!(matches!(expr.kind, super::TypedExprKind::OptionValue { .. }));
+                }
+                other => panic!("unexpected statement: {other:?}"),
+            },
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_match_statements_and_variant_patterns() {
+        let source = r#"
+action main(result: Result[Int, Text]) -> Int:
+  match result:
+    Ok(value):
+      return value
+    Err(_):
+      return 0
+"#;
+        let path = Path::new("test.vg");
+        let tokens = Lexer::new(path, source).tokenize().expect("tokenize");
+        let module = Parser::new(path, tokens).parse_module().expect("parse");
+        let resolution = Resolver::new(&module).resolve().expect("resolve");
+        let checked = TypeChecker::new(&module, &resolution)
+            .check()
+            .expect("check");
+        let lowered = lower_module(&checked).expect("lower");
+
+        match &lowered.declarations[0] {
+            TypedDecl::Action(action) => match &action.body[0].kind {
+                TypedStmtKind::Match { arms, .. } => {
+                    assert_eq!(arms.len(), 2);
+                    assert!(matches!(
+                        arms[0].pattern.kind,
+                        super::TypedPatternKind::Variant { .. }
+                    ));
+                    assert!(matches!(
+                        arms[1].pattern.kind,
+                        super::TypedPatternKind::Variant { .. }
+                    ));
                 }
                 other => panic!("unexpected statement: {other:?}"),
             },

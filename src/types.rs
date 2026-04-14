@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    AstModule, BinaryOp, CallArg, Decl, Expr, ExprKind, Param, Purity, Stmt, StmtKind, Target,
-    TypeRef, UnaryOp,
+    AstModule, BinaryOp, CallArg, Decl, Expr, ExprKind, MatchArm, Param, Pattern, PatternKind,
+    PatternLiteral, Purity, RecordPatternField, Stmt, StmtKind, Target, TypeRef, UnaryOp,
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::{Resolution, SymbolKind};
@@ -41,6 +41,16 @@ pub struct RecordType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct EnumType {
+    pub variants: HashMap<String, EnumVariantType>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariantType {
+    pub fields: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExternSignature {
     pub purity: Option<Purity>,
     pub ty: ActionType,
@@ -54,6 +64,7 @@ pub struct CheckedModule {
     pub target_types: HashMap<SourceSpan, Type>,
     pub target_root_mutability: HashMap<SourceSpan, bool>,
     pub records: HashMap<String, RecordType>,
+    pub enums: HashMap<String, EnumType>,
     pub actions: HashMap<String, ActionType>,
     pub externs: HashMap<String, ExternSignature>,
     pub constants: HashMap<String, Type>,
@@ -83,7 +94,7 @@ pub struct TypeChecker<'a> {
     module: &'a AstModule,
     resolution: &'a Resolution,
     records: HashMap<String, RecordType>,
-    enums: HashMap<String, ()>,
+    enums: HashMap<String, EnumType>,
     actions: HashMap<String, ActionType>,
     externs: HashMap<String, ExternSignature>,
     constants: HashMap<String, Type>,
@@ -160,6 +171,7 @@ impl<'a> TypeChecker<'a> {
                 target_types: self.target_types,
                 target_root_mutability: self.target_root_mutability,
                 records: self.records,
+                enums: self.enums,
                 actions: self.actions,
                 externs: self.externs,
                 constants: self.constants,
@@ -182,7 +194,24 @@ impl<'a> TypeChecker<'a> {
                         .insert(record.name.clone(), RecordType { fields });
                 }
                 Decl::Enum(enum_decl) => {
-                    self.enums.insert(enum_decl.name.clone(), ());
+                    self.enums.insert(
+                        enum_decl.name.clone(),
+                        EnumType {
+                            variants: HashMap::new(),
+                        },
+                    );
+                    let mut variants = HashMap::new();
+                    for variant in &enum_decl.variants {
+                        let mut fields = Vec::new();
+                        for field in &variant.fields {
+                            fields.push((
+                                field.name.clone(),
+                                self.lower_type_ref(&field.ty, &field.span)?,
+                            ));
+                        }
+                        variants.insert(variant.name.clone(), EnumVariantType { fields });
+                    }
+                    self.enums.insert(enum_decl.name.clone(), EnumType { variants });
                 }
                 Decl::Action(action) => {
                     let signature = action_signature(
@@ -402,6 +431,19 @@ impl<'a> TypeChecker<'a> {
                     loop_depth + 1,
                 )?;
             }
+            StmtKind::Match { scrutinee, arms } => {
+                let scrutinee_type = self.type_expr(scrutinee, scope, in_test)?;
+                for arm in arms {
+                    self.type_match_arm(
+                        arm,
+                        &scrutinee_type,
+                        scope,
+                        in_test,
+                        expected_return,
+                        loop_depth,
+                    )?;
+                }
+            }
             StmtKind::ForEach {
                 binding,
                 iterable,
@@ -472,6 +514,236 @@ impl<'a> TypeChecker<'a> {
             }
         }
         Ok(())
+    }
+
+    fn type_match_arm(
+        &mut self,
+        arm: &MatchArm,
+        scrutinee_type: &Type,
+        scope: &Scope,
+        in_test: bool,
+        expected_return: &Type,
+        loop_depth: usize,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut bindings = HashMap::new();
+        self.check_pattern(&arm.pattern, scrutinee_type, &mut bindings)?;
+
+        let mut arm_scope = scope.clone();
+        for (name, ty) in bindings {
+            arm_scope.insert(name, ty, false);
+        }
+
+        self.type_block(
+            &arm.body,
+            &mut arm_scope,
+            in_test,
+            expected_return,
+            loop_depth,
+        )
+    }
+
+    fn check_pattern(
+        &self,
+        pattern: &Pattern,
+        expected: &Type,
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match &pattern.kind {
+            PatternKind::Wildcard => Ok(()),
+            PatternKind::Literal(literal) => {
+                let literal_type = match literal {
+                    PatternLiteral::Int(_) => Type::Int,
+                    PatternLiteral::Dec(_) => Type::Dec,
+                    PatternLiteral::String(_) => Type::Text,
+                    PatternLiteral::Bool(_) => Type::Bool,
+                    PatternLiteral::None => Type::None,
+                };
+                if is_assignable(expected, &literal_type) {
+                    Ok(())
+                } else {
+                    Err(vec![type_error(
+                        &pattern.span,
+                        format!(
+                            "pattern literal `{}` is not compatible with `{}`",
+                            describe_pattern_literal(literal),
+                            expected.describe()
+                        ),
+                    )])
+                }
+            }
+            PatternKind::Binding(name) => {
+                if bindings.contains_key(name) {
+                    return Err(vec![type_error(
+                        &pattern.span,
+                        format!("duplicate binding `{name}` in match pattern"),
+                    )]);
+                }
+                bindings.insert(name.clone(), expected.clone());
+                Ok(())
+            }
+            PatternKind::Tuple(items) => match expected {
+                Type::Tuple(types) if types.len() == items.len() => {
+                    for (item, item_type) in items.iter().zip(types.iter()) {
+                        self.check_pattern(item, item_type, bindings)?;
+                    }
+                    Ok(())
+                }
+                Type::Tuple(types) => Err(vec![type_error(
+                    &pattern.span,
+                    format!(
+                        "tuple pattern has arity {}, but matched value has arity {}",
+                        items.len(),
+                        types.len()
+                    ),
+                )]),
+                Type::Unknown => {
+                    for item in items {
+                        self.check_pattern(item, &Type::Unknown, bindings)?;
+                    }
+                    Ok(())
+                }
+                other => Err(vec![type_error(
+                    &pattern.span,
+                    format!("tuple pattern requires a tuple value, found `{}`", other.describe()),
+                )]),
+            },
+            PatternKind::Record { name, fields } => {
+                let record = self.records.get(name).ok_or_else(|| {
+                    vec![type_error(
+                        &pattern.span,
+                        format!("unknown record type `{name}` in match pattern"),
+                    )]
+                })?;
+
+                match expected {
+                    Type::Record(expected_name) if expected_name == name => {}
+                    Type::Unknown => {}
+                    Type::Record(expected_name) => {
+                        return Err(vec![type_error(
+                            &pattern.span,
+                            format!(
+                                "record pattern `{name}` does not match value of type `{expected_name}`"
+                            ),
+                        )]);
+                    }
+                    other => {
+                        return Err(vec![type_error(
+                            &pattern.span,
+                            format!(
+                                "record pattern `{name}` requires `{name}`, found `{}`",
+                                other.describe()
+                            ),
+                        )]);
+                    }
+                }
+
+                for field in fields {
+                    self.check_record_pattern_field(field, record, bindings)?;
+                }
+                Ok(())
+            }
+            PatternKind::Variant { name, args } => {
+                let (field_types, pattern_type) =
+                    self.variant_pattern_signature(name, expected, &pattern.span)?;
+                if field_types.len() != args.len() {
+                    return Err(vec![type_error(
+                        &pattern.span,
+                        format!(
+                            "variant pattern `{name}` expects {} payload field(s), found {}",
+                            field_types.len(),
+                            args.len()
+                        ),
+                    )]);
+                }
+                if !matches!(expected, Type::Unknown) && !is_assignable(expected, &pattern_type) {
+                    return Err(vec![type_error(
+                        &pattern.span,
+                        format!(
+                            "variant pattern `{name}` is not compatible with `{}`",
+                            expected.describe()
+                        ),
+                    )]);
+                }
+                for (arg, field_type) in args.iter().zip(field_types.iter()) {
+                    self.check_pattern(arg, field_type, bindings)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn check_record_pattern_field(
+        &self,
+        field: &RecordPatternField,
+        record: &RecordType,
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let field_type = record.fields.get(&field.name).ok_or_else(|| {
+            vec![type_error(
+                &field.span,
+                format!("record pattern references unknown field `{}`", field.name),
+            )]
+        })?;
+        self.check_pattern(&field.pattern, field_type, bindings)
+    }
+
+    fn variant_pattern_signature(
+        &self,
+        name: &str,
+        expected: &Type,
+        span: &SourceSpan,
+    ) -> Result<(Vec<Type>, Type), Vec<Diagnostic>> {
+        match (expected, name) {
+            (Type::Result(ok, _), "Ok") => Ok((vec![(**ok).clone()], expected.clone())),
+            (Type::Result(_, err), "Err") => Ok((vec![(**err).clone()], expected.clone())),
+            (Type::Option(inner), "Some") => Ok((vec![(**inner).clone()], expected.clone())),
+            (Type::Option(_), "None") => Ok((Vec::new(), expected.clone())),
+            (Type::None, "None") => Ok((Vec::new(), Type::None)),
+            (Type::Enum(enum_name), variant_name) => {
+                let enum_type = self.enums.get(enum_name).ok_or_else(|| {
+                    vec![type_error(
+                        span,
+                        format!("unknown enum type `{enum_name}` in match pattern"),
+                    )]
+                })?;
+                let variant = enum_type.variants.get(variant_name).ok_or_else(|| {
+                    vec![type_error(
+                        span,
+                        format!("enum `{enum_name}` has no variant `{variant_name}`"),
+                    )]
+                })?;
+                Ok((
+                    variant.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                    Type::Enum(enum_name.clone()),
+                ))
+            }
+            (Type::Unknown, "Ok") => Ok((vec![Type::Unknown], Type::Result(
+                Box::new(Type::Unknown),
+                Box::new(Type::Unknown),
+            ))),
+            (Type::Unknown, "Err") => Ok((vec![Type::Unknown], Type::Result(
+                Box::new(Type::Unknown),
+                Box::new(Type::Unknown),
+            ))),
+            (Type::Unknown, "Some") => {
+                Ok((vec![Type::Unknown], Type::Option(Box::new(Type::Unknown))))
+            }
+            (Type::Unknown, "None") => Ok((Vec::new(), Type::Unknown)),
+            (Type::Unknown, variant_name) => {
+                let (enum_name, variant) = self.find_unique_enum_variant(variant_name, span)?;
+                Ok((
+                    variant.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+                    Type::Enum(enum_name),
+                ))
+            }
+            (other, variant_name) => Err(vec![type_error(
+                span,
+                format!(
+                    "variant pattern `{variant_name}` is not valid for `{}`",
+                    other.describe()
+                ),
+            )]),
+        }
     }
 
     fn type_expr(
@@ -545,7 +817,27 @@ impl<'a> TypeChecker<'a> {
                 }
                 Type::Tuple(types)
             }
-            ExprKind::Name(name) => self.lookup_name(name, scope, &expr.span)?,
+            ExprKind::Name(name) => match self.lookup_name(name, scope, &expr.span) {
+                Ok(ty) => ty,
+                Err(diagnostics) => match self.find_unique_enum_variant(name, &expr.span) {
+                    Ok((enum_name, variant)) if variant.fields.is_empty() => Type::Enum(enum_name),
+                    Ok((_, variant)) => {
+                        return Err(vec![type_error(
+                            &expr.span,
+                            format!(
+                                "enum variant `{name}` requires {} argument(s)",
+                                variant.fields.len()
+                            ),
+                        )]);
+                    }
+                    Err(variant_diagnostics)
+                        if variant_diagnostics[0].message == format!("unknown enum variant `{name}`") =>
+                    {
+                        return Err(diagnostics);
+                    }
+                    Err(variant_diagnostics) => return Err(variant_diagnostics),
+                },
+            },
             ExprKind::Call { callee, args } => {
                 self.type_call(callee, args, scope, in_test, &expr.span)?
             }
@@ -689,6 +981,26 @@ impl<'a> TypeChecker<'a> {
                 let inner = self.type_expr(&args[0].expr, scope, in_test)?;
                 return Ok(Type::Option(Box::new(inner)));
             }
+            if name == "Ok" || name == "Err" {
+                if args.len() != 1 {
+                    return Err(vec![type_error(
+                        span,
+                        format!("`{name}(...)` expects exactly one argument"),
+                    )]);
+                }
+                if args[0].name.is_some() {
+                    return Err(vec![type_error(
+                        &args[0].span,
+                        format!("`{name}(...)` does not support named arguments"),
+                    )]);
+                }
+                let payload = self.type_expr(&args[0].expr, scope, in_test)?;
+                return Ok(match name.as_str() {
+                    "Ok" => Type::Result(Box::new(payload), Box::new(Type::Unknown)),
+                    "Err" => Type::Result(Box::new(Type::Unknown), Box::new(payload)),
+                    _ => unreachable!(),
+                });
+            }
         }
 
         if let ExprKind::FieldAccess { base, field } = &callee.kind {
@@ -739,6 +1051,11 @@ impl<'a> TypeChecker<'a> {
                     )]);
                 }
                 return Ok(Type::Record(name.clone()));
+            }
+            if let Some(enum_name) =
+                self.type_enum_variant_constructor(name, args, scope, in_test, span)?
+            {
+                return Ok(Type::Enum(enum_name));
             }
         }
 
@@ -990,6 +1307,128 @@ impl<'a> TypeChecker<'a> {
             Phase::Resolve,
             format!("unresolved symbol `{name}`"),
         )])
+    }
+
+    fn find_unique_enum_variant(
+        &self,
+        name: &str,
+        span: &SourceSpan,
+    ) -> Result<(String, &EnumVariantType), Vec<Diagnostic>> {
+        let matches = self
+            .enums
+            .iter()
+            .filter_map(|(enum_name, enum_type)| {
+                enum_type
+                    .variants
+                    .get(name)
+                    .map(|variant| (enum_name.clone(), variant))
+            })
+            .collect::<Vec<_>>();
+
+        match matches.as_slice() {
+            [] => Err(vec![type_error(
+                span,
+                format!("unknown enum variant `{name}`"),
+            )]),
+            [(enum_name, variant)] => Ok((enum_name.clone(), *variant)),
+            _ => Err(vec![type_error(
+                span,
+                format!("ambiguous enum variant `{name}`"),
+            )]),
+        }
+    }
+
+    fn type_enum_variant_constructor(
+        &mut self,
+        name: &str,
+        args: &[CallArg],
+        scope: &mut Scope,
+        in_test: bool,
+        span: &SourceSpan,
+    ) -> Result<Option<String>, Vec<Diagnostic>> {
+        let (enum_name, variant) = match self.find_unique_enum_variant(name, span) {
+            Ok(found) => found,
+            Err(_) => return Ok(None),
+        };
+        let variant_fields = variant.fields.clone();
+
+        let uses_named = args.iter().any(|arg| arg.name.is_some());
+        let uses_positional = args.iter().any(|arg| arg.name.is_none());
+        if uses_named && uses_positional {
+            return Err(vec![type_error(
+                span,
+                "enum variant constructors may not mix named and positional arguments",
+            )]);
+        }
+
+        if uses_named {
+            let mut remaining = variant_fields
+                .iter()
+                .cloned()
+                .collect::<HashMap<String, Type>>();
+            for arg in args {
+                let arg_name = arg.name.clone().ok_or_else(|| {
+                    vec![type_error(
+                        &arg.span,
+                        "enum variant constructors require named arguments consistently",
+                    )]
+                })?;
+                let expected = remaining.remove(&arg_name).ok_or_else(|| {
+                    vec![type_error(
+                        &arg.span,
+                        format!("enum variant `{name}` has no field `{arg_name}`"),
+                    )]
+                })?;
+                let actual = self.type_expr(&arg.expr, scope, in_test)?;
+                if !is_assignable(&expected, &actual) {
+                    return Err(vec![type_error(
+                        &arg.expr.span,
+                        format!(
+                            "field `{arg_name}` expected `{}`, found `{}`",
+                            expected.describe(),
+                            actual.describe()
+                        ),
+                    )]);
+                }
+            }
+            if !remaining.is_empty() {
+                let mut missing: Vec<_> = remaining.keys().cloned().collect();
+                missing.sort();
+                return Err(vec![type_error(
+                    span,
+                    format!(
+                        "enum variant `{name}` is missing fields: {}",
+                        missing.join(", ")
+                    ),
+                )]);
+            }
+        } else {
+            if args.len() != variant_fields.len() {
+                return Err(vec![type_error(
+                    span,
+                    format!(
+                        "enum variant `{name}` expects {} argument(s), found {}",
+                        variant_fields.len(),
+                        args.len()
+                    ),
+                )]);
+            }
+            for (arg, (_, expected)) in args.iter().zip(variant_fields.iter()) {
+                let actual = self.type_expr(&arg.expr, scope, in_test)?;
+                if !is_assignable(expected, &actual) {
+                    return Err(vec![type_error(
+                        &arg.expr.span,
+                        format!(
+                            "enum variant `{name}` expected `{}`, found `{}`",
+                            expected.describe(),
+                            actual.describe()
+                        ),
+                    )]);
+                }
+            }
+        }
+
+        Ok(Some(enum_name))
     }
 
     pub(crate) fn lower_type_ref(
@@ -1287,12 +1726,35 @@ fn type_binary(
 }
 
 fn is_assignable(expected: &Type, actual: &Type) -> bool {
-    expected == actual
-        || matches!((expected, actual), (Type::Option(_), Type::None))
-        || matches!((expected, actual), (Type::Option(inner), other) if **inner == *other)
-        || matches!((expected, actual), (Type::Dec, Type::Int))
-        || expected == &Type::Unknown
-        || actual == &Type::Unknown
+    match (expected, actual) {
+        (Type::Unknown, _) | (_, Type::Unknown) => true,
+        (left, right) if left == right => true,
+        (Type::Option(_), Type::None) => true,
+        (Type::Option(expected_inner), Type::Option(actual_inner)) => {
+            is_assignable(expected_inner, actual_inner)
+        }
+        (Type::Option(expected_inner), other) => is_assignable(expected_inner, other),
+        (Type::Result(expected_ok, expected_err), Type::Result(actual_ok, actual_err)) => {
+            is_assignable(expected_ok, actual_ok) && is_assignable(expected_err, actual_err)
+        }
+        (Type::List(expected_inner), Type::List(actual_inner))
+        | (Type::Set(expected_inner), Type::Set(actual_inner)) => {
+            is_assignable(expected_inner, actual_inner)
+        }
+        (Type::Map(expected_key, expected_value), Type::Map(actual_key, actual_value)) => {
+            is_assignable(expected_key, actual_key) && is_assignable(expected_value, actual_value)
+        }
+        (Type::Tuple(expected_items), Type::Tuple(actual_items))
+            if expected_items.len() == actual_items.len() =>
+        {
+            expected_items
+                .iter()
+                .zip(actual_items.iter())
+                .all(|(expected_item, actual_item)| is_assignable(expected_item, actual_item))
+        }
+        (Type::Dec, Type::Int) => true,
+        _ => false,
+    }
 }
 
 fn type_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
@@ -1371,6 +1833,16 @@ fn builtin_result_or_option_call_type(
     };
 
     Ok(result_type)
+}
+
+fn describe_pattern_literal(literal: &PatternLiteral) -> String {
+    match literal {
+        PatternLiteral::Int(value) => value.to_string(),
+        PatternLiteral::Dec(value) => value.clone(),
+        PatternLiteral::String(value) => format!("{value:?}"),
+        PatternLiteral::Bool(value) => value.to_string(),
+        PatternLiteral::None => "None".to_string(),
+    }
 }
 
 impl Type {
@@ -1591,5 +2063,39 @@ action main() -> Bool:
                 .message
                 .contains("built-in operation `is_ok()` requires `Result[_, _]`")
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_bindings_in_match_patterns() {
+        let diagnostics = check(
+            r#"
+action main(value: (Int, Int)) -> Int:
+  match value:
+    (x, x):
+      return x
+  return 0
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(diagnostics[0].message.contains("duplicate binding `x`"));
+    }
+
+    #[test]
+    fn keeps_match_bindings_scoped_to_their_arm() {
+        let diagnostics = check(
+            r#"
+action main(result: Result[Int, Text]) -> Int:
+  match result:
+    Ok(value):
+      return value
+    Err(_):
+      return 0
+  return value
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Resolve);
+        assert!(diagnostics[0].message.contains("unresolved symbol `value`"));
     }
 }
