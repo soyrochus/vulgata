@@ -673,6 +673,34 @@ impl<'a> TypeChecker<'a> {
         }
 
         if let ExprKind::Name(name) = &callee.kind {
+            if name == "Some" {
+                if args.len() != 1 {
+                    return Err(vec![type_error(
+                        span,
+                        "`Some(...)` expects exactly one argument",
+                    )]);
+                }
+                if args[0].name.is_some() {
+                    return Err(vec![type_error(
+                        &args[0].span,
+                        "`Some(...)` does not support named arguments",
+                    )]);
+                }
+                let inner = self.type_expr(&args[0].expr, scope, in_test)?;
+                return Ok(Type::Option(Box::new(inner)));
+            }
+        }
+
+        if let ExprKind::FieldAccess { base, field } = &callee.kind {
+            let base_type = self.type_expr(base, scope, in_test)?;
+            if let Some(result_type) =
+                builtin_result_or_option_call_type(&base_type, field, args, span)?
+            {
+                return Ok(result_type);
+            }
+        }
+
+        if let ExprKind::Name(name) = &callee.kind {
             if let Some(record) = self.records.get(name) {
                 self.expr_types
                     .insert(callee.id, Type::Record(name.clone()));
@@ -1285,6 +1313,66 @@ fn lookup_standard_runtime_callee(callee: &Expr) -> Option<StandardRuntimeAction
     lookup_standard_runtime_action(base, field)
 }
 
+fn builtin_result_or_option_call_type(
+    base_type: &Type,
+    field: &str,
+    args: &[CallArg],
+    span: &SourceSpan,
+) -> Result<Option<Type>, Vec<Diagnostic>> {
+    let is_builtin = matches!(
+        field,
+        "is_ok" | "is_err" | "value" | "error" | "is_some" | "is_none"
+    );
+    if !is_builtin {
+        return Ok(None);
+    }
+
+    if !args.is_empty() {
+        return Err(vec![type_error(
+            span,
+            format!("built-in operation `{field}()` takes no arguments"),
+        )]);
+    }
+
+    let result_type = match (base_type, field) {
+        (Type::Result(_, _), "is_ok" | "is_err") => Some(Type::Bool),
+        (Type::Result(ok, _), "value") => Some((**ok).clone()),
+        (Type::Result(_, err), "error") => Some((**err).clone()),
+        (Type::Option(_), "is_some" | "is_none") => Some(Type::Bool),
+        (Type::Option(inner), "value") => Some((**inner).clone()),
+        (other, "is_ok" | "is_err" | "error") => {
+            return Err(vec![type_error(
+                span,
+                format!(
+                    "built-in operation `{field}()` requires `Result[_, _]`, found `{}`",
+                    other.describe()
+                ),
+            )]);
+        }
+        (other, "is_some" | "is_none") => {
+            return Err(vec![type_error(
+                span,
+                format!(
+                    "built-in operation `{field}()` requires `Option[_]`, found `{}`",
+                    other.describe()
+                ),
+            )]);
+        }
+        (other, "value") => {
+            return Err(vec![type_error(
+                span,
+                format!(
+                    "built-in operation `value()` requires `Result[_, _]` or `Option[_]`, found `{}`",
+                    other.describe()
+                ),
+            )]);
+        }
+        _ => None,
+    };
+
+    Ok(result_type)
+}
+
 impl Type {
     pub fn describe(&self) -> String {
         match self {
@@ -1485,5 +1573,23 @@ action main() -> Int:
 "#,
         )
         .expect("check should succeed");
+    }
+
+    #[test]
+    fn rejects_is_ok_on_non_result_receiver() {
+        let diagnostics = check(
+            r#"
+action main() -> Bool:
+  let value = 1
+  return value.is_ok()
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("built-in operation `is_ok()` requires `Result[_, _]`")
+        );
     }
 }

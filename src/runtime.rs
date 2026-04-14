@@ -14,6 +14,7 @@ use crate::tir::{
     TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
     TypedStmtKind, TypedSymbol, TypedTarget,
 };
+use crate::types::Type;
 
 #[derive(Clone, PartialEq)]
 pub enum Value {
@@ -24,10 +25,32 @@ pub enum Value {
     None,
     ResultOk(Box<Value>),
     ResultErr(Box<Value>),
+    OptionSome(Box<Value>),
+    OptionNone,
     Record(Rc<RefCell<BTreeMap<String, Value>>>),
     List(Rc<RefCell<Vec<Value>>>),
     Map(Rc<RefCell<Vec<(Value, Value)>>>),
     Callable(String),
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Bool(value) => write!(f, "{value}"),
+            Value::Int(value) => write!(f, "{value}"),
+            Value::Dec(value) => write!(f, "{value}"),
+            Value::Text(value) => write!(f, "{value:?}"),
+            Value::None => write!(f, "None"),
+            Value::ResultOk(value) => write!(f, "Ok({})", format_result_value(value)),
+            Value::ResultErr(value) => write!(f, "Err({})", format_result_value(value)),
+            Value::OptionSome(value) => write!(f, "Some({})", format_result_value(value)),
+            Value::OptionNone => write!(f, "None"),
+            Value::Record(fields) => write!(f, "Record({:?})", fields.borrow()),
+            Value::List(items) => write!(f, "List({:?})", items.borrow()),
+            Value::Map(entries) => write!(f, "Map({:?})", entries.borrow()),
+            Value::Callable(name) => write!(f, "Callable({name})"),
+        }
+    }
 }
 
 impl fmt::Debug for Value {
@@ -40,6 +63,8 @@ impl fmt::Debug for Value {
             Value::None => write!(f, "None"),
             Value::ResultOk(value) => write!(f, "Ok({})", format_result_value(value)),
             Value::ResultErr(value) => write!(f, "Err({})", format_result_value(value)),
+            Value::OptionSome(value) => write!(f, "Some({})", format_result_value(value)),
+            Value::OptionNone => write!(f, "None"),
             Value::Record(fields) => f.debug_tuple("Record").field(&fields.borrow()).finish(),
             Value::List(items) => f.debug_tuple("List").field(&items.borrow()).finish(),
             Value::Map(entries) => f.debug_tuple("Map").field(&entries.borrow()).finish(),
@@ -291,8 +316,8 @@ impl<'a> Interpreter<'a> {
         }
 
         let mut env = self.globals.clone();
-        for ((param_name, _), value) in action.params.iter().zip(args) {
-            env.insert(param_name.clone(), value);
+        for ((param_name, param_ty), value) in action.params.iter().zip(args) {
+            env.insert(param_name.clone(), coerce_value_to_type(value, param_ty));
         }
 
         if self.mode.enforces_checkable() {
@@ -315,7 +340,7 @@ impl<'a> Interpreter<'a> {
             }
         }
 
-        Ok(result)
+        Ok(coerce_value_to_type(result, action.ty.action_result()))
     }
 
     fn execute_block(
@@ -354,18 +379,18 @@ impl<'a> Interpreter<'a> {
             TypedStmtKind::RequiresClause(_)
             | TypedStmtKind::EnsuresClause(_)
             | TypedStmtKind::ExampleBlock { .. } => Ok(ExecFlow::Continue),
-            TypedStmtKind::Let { name, value, .. } => {
-                let evaluated = self.eval_expr(value, env)?;
+            TypedStmtKind::Let { name, ty, value } => {
+                let evaluated = coerce_value_to_type(self.eval_expr(value, env)?, ty);
                 env.insert(name.clone(), evaluated);
                 Ok(ExecFlow::Continue)
             }
-            TypedStmtKind::Var { name, value, .. } => {
-                let evaluated = self.eval_expr(value, env)?;
+            TypedStmtKind::Var { name, ty, value } => {
+                let evaluated = coerce_value_to_type(self.eval_expr(value, env)?, ty);
                 env.insert(name.clone(), evaluated);
                 Ok(ExecFlow::Continue)
             }
             TypedStmtKind::Assign { target, value } => {
-                let new_value = self.eval_expr(value, env)?;
+                let new_value = coerce_value_to_type(self.eval_expr(value, env)?, target.ty());
                 self.assign_target(target, new_value, env)?;
                 Ok(ExecFlow::Continue)
             }
@@ -542,7 +567,10 @@ impl<'a> Interpreter<'a> {
             )?;
 
             for (output_name, expr) in outputs {
-                let expected = self.eval_example_expr(expr)?;
+                let mut expected = self.eval_example_expr(expr)?;
+                if output_name == "result" {
+                    expected = coerce_value_to_type(expected, action.ty.action_result());
+                }
                 if actual != expected {
                     return Err(vec![runtime_error(
                         &stmt.span,
@@ -566,7 +594,7 @@ impl<'a> Interpreter<'a> {
         expr: &TypedExpr,
         env: &mut HashMap<String, Value>,
     ) -> Result<Value, Vec<Diagnostic>> {
-        match &expr.kind {
+        let value = match &expr.kind {
             TypedExprKind::Literal(literal) => Ok(match literal {
                 TypedLiteral::Int(value) => Value::Int(*value),
                 TypedLiteral::Dec(value) => Value::Dec(value.clone()),
@@ -588,6 +616,119 @@ impl<'a> Interpreter<'a> {
                     other => Err(vec![runtime_error(
                         &expr.span,
                         format!("field access requires a record, found {other:?}"),
+                    )]),
+                }
+            }
+            TypedExprKind::ResultIsOk { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::ResultOk(_) => Ok(Value::Bool(true)),
+                    Value::ResultErr(_) => Ok(Value::Bool(false)),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `is_ok()` expected Result runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::ResultIsErr { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::ResultOk(_) => Ok(Value::Bool(false)),
+                    Value::ResultErr(_) => Ok(Value::Bool(true)),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `is_err()` expected Result runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::ResultValue { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::ResultOk(value) => Ok(*value),
+                    Value::ResultErr(_) => Err(vec![invalid_access_error(
+                        &expr.span,
+                        "InvalidResultValueAccess",
+                        "value()",
+                        "Err",
+                    )]),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `value()` expected Result runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::ResultError { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::ResultErr(value) => Ok(*value),
+                    Value::ResultOk(_) => Err(vec![invalid_access_error(
+                        &expr.span,
+                        "InvalidResultErrorAccess",
+                        "error()",
+                        "Ok",
+                    )]),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `error()` expected Result runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::OptionIsSome { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::OptionSome(_) => Ok(Value::Bool(true)),
+                    Value::OptionNone => Ok(Value::Bool(false)),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `is_some()` expected Option runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::OptionIsNone { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::OptionSome(_) => Ok(Value::Bool(false)),
+                    Value::OptionNone => Ok(Value::Bool(true)),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `is_none()` expected Option runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
+                    )]),
+                }
+            }
+            TypedExprKind::OptionValue { target } => {
+                let target_value = self.eval_expr(target, env)?;
+                match target_value {
+                    Value::OptionSome(value) => Ok(*value),
+                    Value::OptionNone => Err(vec![invalid_access_error(
+                        &expr.span,
+                        "InvalidOptionValueAccess",
+                        "value()",
+                        "None",
+                    )]),
+                    other => Err(vec![runtime_error(
+                        &expr.span,
+                        format!(
+                            "built-in operation `value()` expected Option runtime value, found {}",
+                            runtime_variant_name(&other)
+                        ),
                     )]),
                 }
             }
@@ -643,7 +784,9 @@ impl<'a> Interpreter<'a> {
                     .map(|item| self.eval_expr(item, env))
                     .collect::<Result<Vec<_>, _>>()?,
             )))),
-        }
+        }?;
+
+        Ok(coerce_value_to_type(value, &expr.ty))
     }
 
     fn eval_call(
@@ -654,8 +797,28 @@ impl<'a> Interpreter<'a> {
         span: &SourceSpan,
     ) -> Result<Value, Vec<Diagnostic>> {
         if let TypedExprKind::Symbol(symbol) = &callee.kind {
+            if symbol.kind.is_none() && symbol.name == "Some" {
+                if args.len() != 1 {
+                    return Err(vec![runtime_error(
+                        span,
+                        "`Some(...)` expects exactly one argument",
+                    )]);
+                }
+                if args[0].name.is_some() {
+                    return Err(vec![runtime_error(
+                        &args[0].expr.span,
+                        "`Some(...)` does not support named arguments",
+                    )]);
+                }
+                let value = self.eval_expr(&args[0].expr, env)?;
+                return Ok(Value::OptionSome(Box::new(value)));
+            }
             if symbol.kind == Some(SymbolKind::Record) {
                 let mut fields = BTreeMap::new();
+                let record_name = match &callee.ty {
+                    Type::Record(name) => Some(name.as_str()),
+                    _ => None,
+                };
                 for arg in args {
                     let name = arg.name.clone().ok_or_else(|| {
                         vec![runtime_error(
@@ -663,7 +826,13 @@ impl<'a> Interpreter<'a> {
                             "record construction requires named arguments",
                         )]
                     })?;
-                    fields.insert(name, self.eval_expr(&arg.expr, env)?);
+                    let mut value = self.eval_expr(&arg.expr, env)?;
+                    if let Some(record_name) = record_name {
+                        if let Some(field_ty) = self.lookup_record_field_type(record_name, &name) {
+                            value = coerce_value_to_type(value, field_ty);
+                        }
+                    }
+                    fields.insert(name, value);
                 }
                 return Ok(Value::Record(Rc::new(RefCell::new(fields))));
             }
@@ -707,6 +876,17 @@ impl<'a> Interpreter<'a> {
             span,
             format!("unknown runtime symbol `{}`", symbol.name),
         )])
+    }
+
+    fn lookup_record_field_type(&self, record_name: &str, field_name: &str) -> Option<&Type> {
+        self.module.declarations.iter().find_map(|decl| match decl {
+            TypedDecl::Record(record) if record.name == record_name => record
+                .fields
+                .iter()
+                .find(|field| field.name == field_name)
+                .map(|field| &field.ty),
+            _ => None,
+        })
     }
 
     fn assign_target(
@@ -947,7 +1127,7 @@ enum TargetRef {
 }
 
 fn eval_const_expr(expr: &TypedExpr) -> Result<Value, Vec<Diagnostic>> {
-    match &expr.kind {
+    let value = match &expr.kind {
         TypedExprKind::Literal(literal) => Ok(match literal {
             TypedLiteral::Int(value) => Value::Int(*value),
             TypedLiteral::Dec(value) => Value::Dec(value.clone()),
@@ -959,7 +1139,8 @@ fn eval_const_expr(expr: &TypedExpr) -> Result<Value, Vec<Diagnostic>> {
             &expr.span,
             "top-level constants currently support literal values only",
         )]),
-    }
+    }?;
+    Ok(coerce_value_to_type(value, &expr.ty))
 }
 
 fn eval_binary(
@@ -1052,6 +1233,17 @@ fn render_typed_expr(expr: &TypedExpr) -> String {
         TypedExprKind::FieldAccess { base, field } => {
             format!("{}.{}", render_typed_expr(base), field)
         }
+        TypedExprKind::ResultIsOk { target } => format!("{}.is_ok()", render_typed_expr(target)),
+        TypedExprKind::ResultIsErr { target } => format!("{}.is_err()", render_typed_expr(target)),
+        TypedExprKind::ResultValue { target } => format!("{}.value()", render_typed_expr(target)),
+        TypedExprKind::ResultError { target } => format!("{}.error()", render_typed_expr(target)),
+        TypedExprKind::OptionIsSome { target } => {
+            format!("{}.is_some()", render_typed_expr(target))
+        }
+        TypedExprKind::OptionIsNone { target } => {
+            format!("{}.is_none()", render_typed_expr(target))
+        }
+        TypedExprKind::OptionValue { target } => format!("{}.value()", render_typed_expr(target)),
         TypedExprKind::Index { base, index } => {
             format!("{}[{}]", render_typed_expr(base), render_typed_expr(index))
         }
@@ -1121,6 +1313,49 @@ fn runtime_error(span: &SourceSpan, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(span.clone(), Phase::Runtime, message)
 }
 
+fn invalid_access_error(
+    span: &SourceSpan,
+    error_name: &str,
+    operation: &str,
+    actual_variant: &str,
+) -> Diagnostic {
+    runtime_error(
+        span,
+        format!("{error_name}: cannot call `{operation}` on {actual_variant}"),
+    )
+}
+
+fn runtime_variant_name(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "Bool",
+        Value::Int(_) => "Int",
+        Value::Dec(_) => "Dec",
+        Value::Text(_) => "Text",
+        Value::None => "None",
+        Value::ResultOk(_) => "Ok",
+        Value::ResultErr(_) => "Err",
+        Value::OptionSome(_) => "Some",
+        Value::OptionNone => "None",
+        Value::Record(_) => "Record",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::Callable(_) => "Callable",
+    }
+}
+
+fn coerce_value_to_type(value: Value, expected: &Type) -> Value {
+    match expected {
+        Type::Option(inner) => match value {
+            Value::OptionSome(value) => {
+                Value::OptionSome(Box::new(coerce_value_to_type(*value, inner)))
+            }
+            Value::OptionNone | Value::None => Value::OptionNone,
+            other => Value::OptionSome(Box::new(coerce_value_to_type(other, inner))),
+        },
+        _ => value,
+    }
+}
+
 impl Value {
     fn ok(value: Value) -> Self {
         Self::ResultOk(Box::new(value))
@@ -1143,6 +1378,8 @@ impl Value {
             Value::None => Value::None,
             Value::ResultOk(value) => Value::ResultOk(Box::new(value.snapshot())),
             Value::ResultErr(value) => Value::ResultErr(Box::new(value.snapshot())),
+            Value::OptionSome(value) => Value::OptionSome(Box::new(value.snapshot())),
+            Value::OptionNone => Value::OptionNone,
             Value::Record(fields) => Value::Record(Rc::new(RefCell::new(
                 fields
                     .borrow()
@@ -1181,6 +1418,27 @@ impl TypedTarget {
             TypedTarget::Name { span, .. } => span,
             TypedTarget::Field { span, .. } => span,
             TypedTarget::Index { span, .. } => span,
+        }
+    }
+
+    fn ty(&self) -> &Type {
+        match self {
+            TypedTarget::Name { ty, .. } => ty,
+            TypedTarget::Field { ty, .. } => ty,
+            TypedTarget::Index { ty, .. } => ty,
+        }
+    }
+}
+
+trait ActionTypeExt {
+    fn action_result(&self) -> &Type;
+}
+
+impl ActionTypeExt for Type {
+    fn action_result(&self) -> &Type {
+        match self {
+            Type::Action(action) => &action.result,
+            other => panic!("expected action type, found {}", other.describe()),
         }
     }
 }
@@ -1363,6 +1621,166 @@ action main() -> Result[Text, Text]:
     }
 
     #[test]
+    fn supports_result_inspection_operations() {
+        let dir = std::env::temp_dir().join(format!("vulgata-result-{}", std::process::id()));
+        let path = dir.join("missing-file.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Bool:
+  let ok = console.print("")
+  let err = file.read_text("{path}")
+  return ok.is_ok() and not ok.is_err() and err.is_err() and not err.is_ok()
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        assert_eq!(result.value, Value::Bool(true));
+    }
+
+    #[test]
+    fn extracts_result_value_from_ok() {
+        let dir = std::env::temp_dir().join(format!("vulgata-result-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("result-value.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Text:
+  let _written = file.write_text("{path}", "hello")
+  let result = file.read_text("{path}")
+  return result.value()
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        assert_eq!(result.value, Value::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn reports_invalid_result_value_access() {
+        let dir = std::env::temp_dir().join(format!("vulgata-result-{}", std::process::id()));
+        let path = dir.join("missing-file.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Text:
+  let result = file.read_text("{path}")
+  return result.value()
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let diagnostics = interpreter.run_main().expect_err("run should fail");
+        assert!(diagnostics[0].message.contains("InvalidResultValueAccess"));
+        assert!(diagnostics[0].message.contains("value()"));
+        assert!(diagnostics[0].message.contains("Err"));
+    }
+
+    #[test]
+    fn extracts_result_error_from_err() {
+        let dir = std::env::temp_dir().join(format!("vulgata-result-{}", std::process::id()));
+        let path = dir.join("missing-file.txt");
+        let path = path.to_string_lossy().replace('\\', "\\\\");
+        let module = lower(&format!(
+            r#"
+action main() -> Text:
+  let result = file.read_text("{path}")
+  return result.error()
+"#
+        ));
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let result = interpreter.run_main().expect("run");
+        match result.value {
+            Value::Text(message) => assert!(!message.is_empty()),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_invalid_result_error_access() {
+        let module = lower(
+            r#"
+action main() -> Text:
+  let result = console.print("")
+  return result.error()
+"#,
+        );
+        let interpreter = Interpreter::new(&module).expect("interpreter");
+        let diagnostics = interpreter.run_main().expect_err("run should fail");
+        assert!(diagnostics[0].message.contains("InvalidResultErrorAccess"));
+        assert!(diagnostics[0].message.contains("error()"));
+        assert!(diagnostics[0].message.contains("Ok"));
+    }
+
+    #[test]
+    fn normalizes_typed_option_values_and_supports_option_inspection() {
+        let result = run_with_mode(
+            r#"
+action main() -> Bool:
+  let some: Option[Int] = 10
+  let none_value: Option[Int] = none
+  return some.is_some() and not some.is_none() and none_value.is_none() and not none_value.is_some()
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn extracts_option_value_from_some() {
+        let result = run_with_mode(
+            r#"
+action main() -> Int:
+  let value: Option[Int] = 10
+  return value.value()
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(result, Value::Int(10));
+    }
+
+    #[test]
+    fn reports_invalid_option_value_access() {
+        let diagnostics = run_with_mode(
+            r#"
+action main() -> Int:
+  let value: Option[Int] = none
+  return value.value()
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect_err("run should fail");
+        assert!(diagnostics[0].message.contains("InvalidOptionValueAccess"));
+        assert!(diagnostics[0].message.contains("value()"));
+        assert!(diagnostics[0].message.contains("None"));
+    }
+
+    #[test]
+    fn returns_options_with_dedicated_runtime_variants() {
+        let some = run_with_mode(
+            r#"
+action main() -> Option[Int]:
+  return Some(10)
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(some, Value::OptionSome(Box::new(Value::Int(10))));
+
+        let none_value = run_with_mode(
+            r#"
+action main() -> Option[Int]:
+  return none
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(none_value, Value::OptionNone);
+    }
+
+    #[test]
     fn descriptive_constructs_do_not_change_results_in_any_mode() {
         let source = r#"
 record Customer:
@@ -1502,6 +1920,7 @@ fn format_result_value(value: &Value) -> String {
     match value {
         Value::Text(text) => format!("{text:?}"),
         Value::None => "()".to_string(),
+        Value::OptionNone => "None".to_string(),
         other => format!("{other:?}"),
     }
 }

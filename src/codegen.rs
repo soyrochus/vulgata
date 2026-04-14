@@ -213,7 +213,12 @@ fn lower_action_body(
     let reassigned = collect_direct_name_assignments(&action.body);
     let mut body = Vec::new();
     for stmt in &action.body {
-        body.push(lower_stmt(stmt, false, &reassigned)?);
+        body.push(lower_stmt(
+            stmt,
+            false,
+            &reassigned,
+            action.ty.action_result(),
+        )?);
     }
 
     if block_may_fall_through(&body) && *action.ty.action_result() == Type::None {
@@ -238,7 +243,7 @@ fn lower_test_body(
         mutable: true,
     }];
     for stmt in &test_decl.body {
-        body.push(lower_stmt(stmt, true, &reassigned)?);
+        body.push(lower_stmt(stmt, true, &reassigned, &Type::None)?);
     }
     body.push(RustStmt::Return(Some(RustExpr::raw("failures"))));
     Ok(body)
@@ -248,28 +253,29 @@ fn lower_stmt(
     stmt: &TypedStmt,
     in_test: bool,
     reassigned: &HashSet<String>,
+    return_type: &Type,
 ) -> Result<RustStmt, Vec<Diagnostic>> {
     let lowered = match &stmt.kind {
         TypedStmtKind::Let { name, ty, value } => RustStmt::Let {
             name: name.clone(),
             ty: Some(lower_storage_type(ty, &stmt.span)?),
-            value: lower_expr(value)?,
+            value: coerce_expr_to_type(lower_expr(value)?, &value.ty, ty),
             mutable: false,
         },
         TypedStmtKind::Var { name, ty, value } => RustStmt::Let {
             name: name.clone(),
             ty: Some(lower_storage_type(ty, &stmt.span)?),
-            value: lower_expr(value)?,
+            value: coerce_expr_to_type(lower_expr(value)?, &value.ty, ty),
             mutable: reassigned.contains(name),
         },
         TypedStmtKind::Assign { target, value } => lower_assignment(target, value)?,
         TypedStmtKind::If {
             branches,
             else_branch,
-        } => lower_if(branches, else_branch, in_test, reassigned)?,
+        } => lower_if(branches, else_branch, in_test, reassigned, return_type)?,
         TypedStmtKind::While { condition, body } => RustStmt::While {
             condition: lower_expr(condition)?,
-            body: lower_block(body, in_test, reassigned)?,
+            body: lower_block(body, in_test, reassigned, return_type)?,
         },
         TypedStmtKind::ForEach {
             binding,
@@ -278,9 +284,19 @@ fn lower_stmt(
         } => RustStmt::ForEach {
             binding: binding.clone(),
             iterable: lower_expr(iterable)?,
-            body: lower_block(body, in_test, reassigned)?,
+            body: lower_block(body, in_test, reassigned, return_type)?,
         },
-        TypedStmtKind::Return(expr) => RustStmt::Return(expr.as_ref().map(lower_expr).transpose()?),
+        TypedStmtKind::Return(expr) => RustStmt::Return(
+            expr.as_ref()
+                .map(|expr| -> Result<RustExpr, Vec<Diagnostic>> {
+                    Ok(coerce_expr_to_type(
+                        lower_expr(expr)?,
+                        &expr.ty,
+                        return_type,
+                    ))
+                })
+                .transpose()?,
+        ),
         TypedStmtKind::Break => RustStmt::Break,
         TypedStmtKind::Continue => RustStmt::Continue,
         TypedStmtKind::IntentBlock { .. }
@@ -319,10 +335,11 @@ fn lower_block(
     block: &[TypedStmt],
     in_test: bool,
     reassigned: &HashSet<String>,
+    return_type: &Type,
 ) -> Result<Vec<RustStmt>, Vec<Diagnostic>> {
     block
         .iter()
-        .map(|stmt| lower_stmt(stmt, in_test, reassigned))
+        .map(|stmt| lower_stmt(stmt, in_test, reassigned, return_type))
         .collect()
 }
 
@@ -331,6 +348,7 @@ fn lower_if(
     else_branch: &[TypedStmt],
     in_test: bool,
     reassigned: &HashSet<String>,
+    return_type: &Type,
 ) -> Result<RustStmt, Vec<Diagnostic>> {
     if branches.is_empty() {
         return Ok(RustStmt::Raw("{}".to_string()));
@@ -339,14 +357,14 @@ fn lower_if(
     let (condition, body) = &branches[0];
     let mut statement = RustStmt::If {
         condition: lower_expr(condition)?,
-        then_body: lower_block(body, in_test, reassigned)?,
-        else_body: lower_block(else_branch, in_test, reassigned)?,
+        then_body: lower_block(body, in_test, reassigned, return_type)?,
+        else_body: lower_block(else_branch, in_test, reassigned, return_type)?,
     };
 
     for (condition, body) in branches.iter().skip(1).rev() {
         statement = RustStmt::If {
             condition: lower_expr(condition)?,
-            then_body: lower_block(body, in_test, reassigned)?,
+            then_body: lower_block(body, in_test, reassigned, return_type)?,
             else_body: vec![statement],
         };
     }
@@ -402,7 +420,7 @@ fn collect_direct_name_assignments_into(block: &[TypedStmt], names: &mut HashSet
 }
 
 fn lower_assignment(target: &TypedTarget, value: &TypedExpr) -> Result<RustStmt, Vec<Diagnostic>> {
-    let value = lower_expr(value)?;
+    let value = coerce_expr_to_type(lower_expr(value)?, &value.ty, target.ty());
     match target {
         TypedTarget::Name { symbol, .. } => Ok(RustStmt::Assign {
             target: RustExpr::raw(symbol.name.clone()),
@@ -454,6 +472,16 @@ fn lower_assignment(target: &TypedTarget, value: &TypedExpr) -> Result<RustStmt,
     }
 }
 
+fn coerce_expr_to_type(expr: RustExpr, actual: &Type, expected: &Type) -> RustExpr {
+    match (expected, actual) {
+        (Type::Option(_), Type::None) => RustExpr::raw("None"),
+        (Type::Option(inner), other) if **inner == *other => {
+            RustExpr::raw(format!("Some({})", render_expr(&expr)))
+        }
+        _ => expr,
+    }
+}
+
 fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
     match &expr.kind {
         TypedExprKind::Literal(literal) => Ok(lower_literal(literal)),
@@ -472,6 +500,34 @@ fn lower_expr(expr: &TypedExpr) -> Result<RustExpr, Vec<Diagnostic>> {
                 )]),
             }
         }
+        TypedExprKind::ResultIsOk { target } => Ok(RustExpr::raw(format!(
+            "{}.is_ok()",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::ResultIsErr { target } => Ok(RustExpr::raw(format!(
+            "{}.is_err()",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::ResultValue { target } => Ok(RustExpr::raw(format!(
+            "match {} {{ Ok(v) => v, Err(_) => panic!(\"InvalidResultValueAccess\") }}",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::ResultError { target } => Ok(RustExpr::raw(format!(
+            "match {} {{ Err(e) => e, Ok(_) => panic!(\"InvalidResultErrorAccess\") }}",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::OptionIsSome { target } => Ok(RustExpr::raw(format!(
+            "{}.is_some()",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::OptionIsNone { target } => Ok(RustExpr::raw(format!(
+            "{}.is_none()",
+            render_expr(&lower_expr(target)?)
+        ))),
+        TypedExprKind::OptionValue { target } => Ok(RustExpr::raw(format!(
+            "match {} {{ Some(v) => v, None => panic!(\"InvalidOptionValueAccess\") }}",
+            render_expr(&lower_expr(target)?)
+        ))),
         TypedExprKind::Index { base, index } => {
             let base_expr = lower_expr(base)?;
             let index_expr = lower_expr(index)?;
@@ -600,6 +656,24 @@ fn lower_call(
         if let Some(action) = lookup_standard_runtime_symbol(symbol) {
             return lower_standard_runtime_call(action, args, &expr.span);
         }
+        if symbol.kind.is_none() && symbol.name == "Some" {
+            if args.len() != 1 {
+                return Err(vec![codegen_error(
+                    &expr.span,
+                    "`Some(...)` expects exactly one argument",
+                )]);
+            }
+            if args[0].name.is_some() {
+                return Err(vec![codegen_error(
+                    &args[0].expr.span,
+                    "`Some(...)` does not support named arguments",
+                )]);
+            }
+            return Ok(RustExpr::raw(format!(
+                "Some({})",
+                render_expr(&lower_expr(&args[0].expr)?)
+            )));
+        }
         match symbol.kind {
             Some(SymbolKind::Record) => {
                 let mut fields = Vec::new();
@@ -623,11 +697,27 @@ fn lower_call(
                 )));
             }
             Some(SymbolKind::Action) => {
+                let action_type = match &callee.ty {
+                    Type::Action(action) => action,
+                    other => {
+                        return Err(vec![codegen_error(
+                            &expr.span,
+                            format!("expected action call type, found `{}`", other.describe()),
+                        )]);
+                    }
+                };
                 return Ok(RustExpr::Call {
                     callee: action_fn_name(&symbol.name),
                     args: args
                         .iter()
-                        .map(|arg| lower_expr(&arg.expr))
+                        .zip(action_type.params.iter())
+                        .map(|(arg, expected)| -> Result<RustExpr, Vec<Diagnostic>> {
+                            Ok(coerce_expr_to_type(
+                                lower_expr(&arg.expr)?,
+                                &arg.expr.ty,
+                                expected,
+                            ))
+                        })
                         .collect::<Result<Vec<_>, _>>()?,
                 });
             }
@@ -1568,5 +1658,49 @@ action main() -> Text:
             String::from_utf8_lossy(&output.stdout).trim(),
             "Text(\"before\")"
         );
+    }
+
+    #[test]
+    fn emits_result_and_option_operations_and_option_coercions() {
+        let module = lower(
+            r#"
+action main() -> Int:
+  let written = console.print("")
+  let maybe: Option[Int] = 10
+  if written.is_ok() and not written.is_err() and maybe.is_some() and not maybe.is_none():
+    return maybe.value()
+  return 0
+"#,
+        );
+
+        let lowered = lower_module(&module).expect("codegen lower");
+        let emitted = emit_module(&lowered);
+
+        assert!(emitted.contains(".is_ok()"));
+        assert!(emitted.contains(".is_err()"));
+        assert!(emitted.contains(".is_some()"));
+        assert!(emitted.contains(".is_none()"));
+        assert!(emitted.contains("InvalidOptionValueAccess"));
+        assert!(emitted.contains("let maybe: Option<i64> = Some(10);"));
+    }
+
+    #[test]
+    fn emits_explicit_match_for_result_value_and_error() {
+        let module = lower(
+            r#"
+action main() -> Text:
+  let result = file.read_text("missing.txt")
+  if result.is_ok():
+    return result.value()
+  return result.error()
+"#,
+        );
+
+        let lowered = lower_module(&module).expect("codegen lower");
+        let emitted = emit_module(&lowered);
+
+        assert!(emitted.contains("InvalidResultValueAccess"));
+        assert!(emitted.contains("InvalidResultErrorAccess"));
+        assert!(emitted.contains("match"));
     }
 }

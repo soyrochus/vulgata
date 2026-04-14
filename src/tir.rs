@@ -180,6 +180,27 @@ pub enum TypedExprKind {
         base: Box<TypedExpr>,
         field: String,
     },
+    ResultIsOk {
+        target: Box<TypedExpr>,
+    },
+    ResultIsErr {
+        target: Box<TypedExpr>,
+    },
+    ResultValue {
+        target: Box<TypedExpr>,
+    },
+    ResultError {
+        target: Box<TypedExpr>,
+    },
+    OptionIsSome {
+        target: Box<TypedExpr>,
+    },
+    OptionIsNone {
+        target: Box<TypedExpr>,
+    },
+    OptionValue {
+        target: Box<TypedExpr>,
+    },
     Index {
         base: Box<TypedExpr>,
         index: Box<TypedExpr>,
@@ -545,13 +566,21 @@ fn lower_expr(checked: &CheckedModule, expr: &Expr) -> Result<TypedExpr, Vec<Dia
                 .get(name)
                 .map(|symbol| symbol.kind),
         }),
-        ExprKind::Call { callee, args } => TypedExprKind::Call {
-            callee: Box::new(lower_expr(checked, callee)?),
-            args: args
-                .iter()
-                .map(|arg| lower_call_arg(checked, arg))
-                .collect::<Result<Vec<_>, _>>()?,
-        },
+        ExprKind::Call { callee, args } => {
+            if let Some(kind) = lower_builtin_result_or_option_call(checked, callee, args)? {
+                kind
+            } else if let Some(kind) = lower_some_constructor_call(checked, callee, args)? {
+                kind
+            } else {
+                TypedExprKind::Call {
+                    callee: Box::new(lower_expr(checked, callee)?),
+                    args: args
+                        .iter()
+                        .map(|arg| lower_call_arg(checked, arg))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }
+            }
+        }
         ExprKind::FieldAccess { base, field } => {
             if let Some(action) = lookup_standard_runtime_action(base, field) {
                 TypedExprKind::Symbol(TypedSymbol {
@@ -584,6 +613,88 @@ fn lower_expr(checked: &CheckedModule, expr: &Expr) -> Result<TypedExpr, Vec<Dia
         ty,
         span: expr.span.clone(),
     })
+}
+
+fn lower_builtin_result_or_option_call(
+    checked: &CheckedModule,
+    callee: &Expr,
+    args: &[CallArg],
+) -> Result<Option<TypedExprKind>, Vec<Diagnostic>> {
+    let ExprKind::FieldAccess { base, field } = &callee.kind else {
+        return Ok(None);
+    };
+    if !args.is_empty() {
+        return Ok(None);
+    }
+
+    let base_type = expr_type(checked, base)?;
+    let op = match (&base_type, field.as_str()) {
+        (Type::Result(_, _), "is_ok") => Some(BuiltinMemberOp::ResultIsOk),
+        (Type::Result(_, _), "is_err") => Some(BuiltinMemberOp::ResultIsErr),
+        (Type::Result(_, _), "value") => Some(BuiltinMemberOp::ResultValue),
+        (Type::Result(_, _), "error") => Some(BuiltinMemberOp::ResultError),
+        (Type::Option(_), "is_some") => Some(BuiltinMemberOp::OptionIsSome),
+        (Type::Option(_), "is_none") => Some(BuiltinMemberOp::OptionIsNone),
+        (Type::Option(_), "value") => Some(BuiltinMemberOp::OptionValue),
+        _ => None,
+    };
+
+    let Some(op) = op else {
+        return Ok(None);
+    };
+
+    let target = Box::new(lower_expr(checked, base)?);
+    let kind = match op {
+        BuiltinMemberOp::ResultIsOk => TypedExprKind::ResultIsOk { target },
+        BuiltinMemberOp::ResultIsErr => TypedExprKind::ResultIsErr { target },
+        BuiltinMemberOp::ResultValue => TypedExprKind::ResultValue { target },
+        BuiltinMemberOp::ResultError => TypedExprKind::ResultError { target },
+        BuiltinMemberOp::OptionIsSome => TypedExprKind::OptionIsSome { target },
+        BuiltinMemberOp::OptionIsNone => TypedExprKind::OptionIsNone { target },
+        BuiltinMemberOp::OptionValue => TypedExprKind::OptionValue { target },
+    };
+
+    Ok(Some(kind))
+}
+
+fn lower_some_constructor_call(
+    checked: &CheckedModule,
+    callee: &Expr,
+    args: &[CallArg],
+) -> Result<Option<TypedExprKind>, Vec<Diagnostic>> {
+    let ExprKind::Name(name) = &callee.kind else {
+        return Ok(None);
+    };
+    if name != "Some" {
+        return Ok(None);
+    }
+
+    let args = args
+        .iter()
+        .map(|arg| lower_call_arg(checked, arg))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(TypedExprKind::Call {
+        callee: Box::new(TypedExpr {
+            kind: TypedExprKind::Symbol(TypedSymbol {
+                name: "Some".to_string(),
+                kind: None,
+            }),
+            ty: Type::Unknown,
+            span: callee.span.clone(),
+        }),
+        args,
+    }))
+}
+
+enum BuiltinMemberOp {
+    ResultIsOk,
+    ResultIsErr,
+    ResultValue,
+    ResultError,
+    OptionIsSome,
+    OptionIsNone,
+    OptionValue,
 }
 
 fn lower_call_arg(checked: &CheckedModule, arg: &CallArg) -> Result<TypedCallArg, Vec<Diagnostic>> {
@@ -793,6 +904,47 @@ action main(value: Int) -> Int:
                 assert!(matches!(action.body[3].kind, TypedStmtKind::StepBlock { .. }));
                 assert!(matches!(action.body[4].kind, TypedStmtKind::EnsuresClause(_)));
             }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_result_and_option_member_calls_to_dedicated_nodes() {
+        let source = r#"
+action result_flag() -> Bool:
+  let written = console.print("")
+  return written.is_ok()
+
+action option_value() -> Int:
+  let maybe: Option[Int] = 10
+  return maybe.value()
+"#;
+        let path = Path::new("test.vg");
+        let tokens = Lexer::new(path, source).tokenize().expect("tokenize");
+        let module = Parser::new(path, tokens).parse_module().expect("parse");
+        let resolution = Resolver::new(&module).resolve().expect("resolve");
+        let checked = TypeChecker::new(&module, &resolution)
+            .check()
+            .expect("check");
+        let lowered = lower_module(&checked).expect("lower");
+
+        match &lowered.declarations[0] {
+            TypedDecl::Action(action) => match &action.body[1].kind {
+                TypedStmtKind::Return(Some(expr)) => {
+                    assert!(matches!(expr.kind, super::TypedExprKind::ResultIsOk { .. }));
+                }
+                other => panic!("unexpected statement: {other:?}"),
+            },
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+
+        match &lowered.declarations[1] {
+            TypedDecl::Action(action) => match &action.body[1].kind {
+                TypedStmtKind::Return(Some(expr)) => {
+                    assert!(matches!(expr.kind, super::TypedExprKind::OptionValue { .. }));
+                }
+                other => panic!("unexpected statement: {other:?}"),
+            },
             other => panic!("unexpected declaration: {other:?}"),
         }
     }
