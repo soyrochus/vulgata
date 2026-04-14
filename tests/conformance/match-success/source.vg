@@ -1,0 +1,15 @@
+record Customer:
+  name: Text
+
+enum Decision:
+  Accept(reason: Text)
+  Reject
+
+action main() -> Text:
+  let customer = Customer(name: "Ada")
+  let decision = Accept("ok")
+  match decision:
+    Accept(reason):
+      return reason
+    Reject():
+      return "reject"

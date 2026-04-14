@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::ast::{
-    ActionDecl, AstModule, BinaryOp, CallArg, ConditionalBranch, ConstDecl, Decl, EnumDecl,
-    EnumVariant, Expr, ExprKind, ExternDecl, FieldDecl, ImportDecl, ImportKind, MatchArm,
-    ModuleDecl, ModuleName, NodeId, Param, Pattern, PatternKind, PatternLiteral, Purity,
-    RecordDecl, RecordPatternField, Stmt, StmtKind, Target, TestDecl, TypeRef, UnaryOp,
-    VariantField,
+    ActionDecl, AstModule, BinaryOp, BindingPattern, BindingPatternKind, CallArg,
+    ConditionalBranch, ConstDecl, Decl, EnumDecl, EnumVariant, Expr, ExprKind, ExternDecl,
+    FieldDecl, ImportDecl, ImportKind, MatchArm, ModuleDecl, ModuleName, NodeId, Param, Pattern,
+    PatternKind, PatternLiteral, Purity, RecordBindingField, RecordDecl, RecordPatternField, Stmt,
+    StmtKind, Target, TestDecl, TypeRef, UnaryOp, VariantField,
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::lexer::{SpannedToken, Token};
@@ -379,6 +379,10 @@ impl Parser {
                     return Err(vec![self.error_here(
                         "legacy `set target = value` syntax is not supported; use `target := value`",
                     )]);
+                } else if self.is_unsupported_destructuring_assignment_stmt() {
+                    return Err(vec![self.error_here(
+                        "destructuring in `:=` is not supported",
+                    )]);
                 } else if self.is_assignment_stmt() {
                     self.parse_assign_stmt()?
                 } else {
@@ -539,7 +543,7 @@ impl Parser {
 
     fn parse_let_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
         self.expect_simple(Token::Let, "expected `let`")?;
-        let name = self.expect_identifier("expected variable name")?;
+        let pattern = self.parse_binding_pattern()?;
         let explicit_type = if self.at(&Token::Colon) {
             self.bump();
             Some(self.parse_type()?)
@@ -550,7 +554,7 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect_newline("expected newline after let statement")?;
         Ok(StmtKind::Let {
-            name,
+            pattern,
             explicit_type,
             value,
         })
@@ -558,7 +562,7 @@ impl Parser {
 
     fn parse_var_stmt(&mut self) -> Result<StmtKind, Vec<Diagnostic>> {
         self.expect_simple(Token::Var, "expected `var`")?;
-        let name = self.expect_identifier("expected variable name")?;
+        let pattern = self.parse_binding_pattern()?;
         let explicit_type = if self.at(&Token::Colon) {
             self.bump();
             Some(self.parse_type()?)
@@ -569,7 +573,7 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect_newline("expected newline after var statement")?;
         Ok(StmtKind::Var {
-            name,
+            pattern,
             explicit_type,
             value,
         })
@@ -687,6 +691,114 @@ impl Parser {
         };
         self.expect_newline("expected newline after return statement")?;
         Ok(StmtKind::Return(expr))
+    }
+
+    fn parse_binding_pattern(&mut self) -> Result<BindingPattern, Vec<Diagnostic>> {
+        let span = self.current_span();
+        let kind = match self.current_token() {
+            Token::Identifier(name) if name == "_" => {
+                return Err(vec![self.error_here(
+                    "wildcard destructuring is not supported in declarations",
+                )]);
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.bump();
+                if self.at(&Token::LParen) {
+                    self.parse_record_binding_pattern(name)?
+                } else {
+                    BindingPatternKind::Name(name)
+                }
+            }
+            Token::LParen => self.parse_tuple_binding_pattern()?,
+            _ => return Err(vec![self.error_here("expected a binding pattern")]),
+        };
+        Ok(BindingPattern { kind, span })
+    }
+
+    fn parse_tuple_binding_pattern(&mut self) -> Result<BindingPatternKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::LParen, "expected `(`")?;
+        let first = self.parse_binding_name_in_pattern("tuple destructuring")?;
+        if !self.at(&Token::Comma) {
+            return Err(vec![self.error_here(
+                "tuple destructuring requires at least two binding names",
+            )]);
+        }
+
+        let mut items = vec![first];
+        while self.at(&Token::Comma) {
+            self.bump();
+            items.push(self.parse_binding_name_in_pattern("tuple destructuring")?);
+        }
+        self.expect_simple(Token::RParen, "expected `)` after tuple destructuring")?;
+        Ok(BindingPatternKind::Tuple(items))
+    }
+
+    fn parse_record_binding_pattern(
+        &mut self,
+        name: String,
+    ) -> Result<BindingPatternKind, Vec<Diagnostic>> {
+        self.expect_simple(Token::LParen, "expected `(` after record name")?;
+        if self.at(&Token::RParen) {
+            return Err(vec![self.error_here(
+                "record destructuring must bind at least one field",
+            )]);
+        }
+        let is_record_pattern = matches!(
+            (self.current_token(), self.peek_token()),
+            (Token::Identifier(_), Some(token)) if token.same_variant(&Token::Colon)
+        );
+        if !is_record_pattern {
+            return Err(vec![self.error_here(
+                "enum or positional destructuring is not supported in declarations",
+            )]);
+        }
+
+        let mut fields = Vec::new();
+        loop {
+            let span = self.current_span();
+            let field = self.expect_identifier("expected record field name")?;
+            self.expect_simple(Token::Colon, "expected `:` after record field name")?;
+            let binding = self.parse_binding_name_in_pattern("record destructuring")?;
+            fields.push(RecordBindingField {
+                field,
+                binding,
+                span,
+            });
+            if !self.at(&Token::Comma) {
+                break;
+            }
+            self.bump();
+        }
+        self.expect_simple(Token::RParen, "expected `)` after record destructuring")?;
+        Ok(BindingPatternKind::Record { name, fields })
+    }
+
+    fn parse_binding_name_in_pattern(
+        &mut self,
+        context: &str,
+    ) -> Result<String, Vec<Diagnostic>> {
+        match self.current_token() {
+            Token::Identifier(name) if name == "_" => Err(vec![self.error_here(format!(
+                "wildcard destructuring is not supported in {context}"
+            ))]),
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.bump();
+                if self.at(&Token::LParen) {
+                    return Err(vec![self.error_here(format!(
+                        "nested destructuring is not supported in {context}"
+                    ))]);
+                }
+                Ok(name)
+            }
+            Token::LParen => Err(vec![self.error_here(format!(
+                "nested destructuring is not supported in {context}"
+            ))]),
+            _ => Err(vec![self.error_here(format!(
+                "expected a binding name in {context}"
+            ))]),
+        }
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, Vec<Diagnostic>> {
@@ -935,6 +1047,54 @@ impl Parser {
                 _ => return false,
             }
         }
+    }
+
+    fn is_unsupported_destructuring_assignment_stmt(&self) -> bool {
+        match self.tokens.get(self.position).map(|token| &token.token) {
+            Some(Token::LParen) => self
+                .scan_balanced_parens(self.position)
+                .is_some_and(|cursor| {
+                    self.tokens
+                        .get(cursor)
+                        .is_some_and(|token| token.token.same_variant(&Token::ColonAssign))
+                }),
+            Some(Token::Identifier(_)) => {
+                if !self
+                    .tokens
+                    .get(self.position + 1)
+                    .is_some_and(|token| token.token.same_variant(&Token::LParen))
+                {
+                    return false;
+                }
+                self.scan_balanced_parens(self.position + 1)
+                    .is_some_and(|cursor| {
+                        self.tokens
+                            .get(cursor)
+                            .is_some_and(|token| token.token.same_variant(&Token::ColonAssign))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn scan_balanced_parens(&self, start: usize) -> Option<usize> {
+        let mut cursor = start;
+        let mut depth = 0usize;
+        while let Some(token) = self.tokens.get(cursor).map(|token| &token.token) {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(cursor + 1);
+                    }
+                }
+                Token::Newline | Token::Indent | Token::Dedent | Token::Eof => return None,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        None
     }
 
     fn is_legacy_set_stmt(&self) -> bool {
@@ -1554,7 +1714,7 @@ fn expr_is_literal(expr: &Expr) -> bool {
 mod tests {
     use std::path::Path;
 
-    use crate::ast::{Decl, ExprKind, PatternKind, StmtKind, Target};
+    use crate::ast::{BindingPatternKind, Decl, ExprKind, PatternKind, StmtKind, Target};
     use crate::lexer::Lexer;
 
     use super::Parser;
@@ -1590,7 +1750,10 @@ test main_basic:
         assert_eq!(module.declarations.len(), 3);
         match &module.declarations[1] {
             Decl::Action(action) => match &action.body[0].kind {
-                StmtKind::Var { name, .. } => assert_eq!(name, "current"),
+                StmtKind::Var { pattern, .. } => match &pattern.kind {
+                    BindingPatternKind::Name(name) => assert_eq!(name, "current"),
+                    other => panic!("unexpected binding pattern: {other:?}"),
+                },
                 other => panic!("unexpected statement: {other:?}"),
             },
             other => panic!("unexpected declaration: {other:?}"),
@@ -1741,6 +1904,70 @@ action main(result: Result[Customer, Text]) -> Text:
                 other => panic!("unexpected statement: {other:?}"),
             },
             other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_tuple_and_record_binding_destructuring() {
+        let module = parse(
+            r#"
+record Customer:
+  name: Text
+  email: Text
+
+action main(pair: (Int, Int), customer: Customer) -> Int:
+  let (left, right) = pair
+  var Customer(name: name, email: address) = customer
+  return left
+"#,
+        );
+
+        match &module.declarations[1] {
+            Decl::Action(action) => {
+                match &action.body[0].kind {
+                    StmtKind::Let { pattern, .. } => match &pattern.kind {
+                        BindingPatternKind::Tuple(items) => {
+                            assert_eq!(items, &vec!["left".to_string(), "right".to_string()]);
+                        }
+                        other => panic!("unexpected tuple binding pattern: {other:?}"),
+                    },
+                    other => panic!("unexpected statement: {other:?}"),
+                }
+                match &action.body[1].kind {
+                    StmtKind::Var { pattern, .. } => match &pattern.kind {
+                        BindingPatternKind::Record { name, fields } => {
+                            assert_eq!(name, "Customer");
+                            assert_eq!(fields.len(), 2);
+                            assert_eq!(fields[0].field, "name");
+                            assert_eq!(fields[0].binding, "name");
+                            assert_eq!(fields[1].field, "email");
+                            assert_eq!(fields[1].binding, "address");
+                        }
+                        other => panic!("unexpected record binding pattern: {other:?}"),
+                    },
+                    other => panic!("unexpected statement: {other:?}"),
+                }
+            }
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_binding_destructuring_forms() {
+        for source in [
+            "action main(maybe: Option[Int]) -> Int:\n  let Some(value) = maybe\n  return 0\n",
+            "action main(pair: (Int, (Int, Int))) -> Int:\n  let (a, (b, c)) = pair\n  return a\n",
+            "action main(pair: (Int, Int)) -> Int:\n  let (_, b) = pair\n  return b\n",
+            "action main(pair: (Int, Int)) -> Int:\n  let (a) = pair\n  return 0\n",
+            "action main(pair: (Int, Int)) -> Int:\n  (a, b) := pair\n  return 0\n",
+        ] {
+            let tokens = Lexer::new(Path::new("bad.vg"), source)
+                .tokenize()
+                .expect("tokenize");
+            let diagnostics = Parser::new(Path::new("bad.vg"), tokens)
+                .parse_module()
+                .expect_err("parse should fail");
+            assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Parse);
         }
     }
 

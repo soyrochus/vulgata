@@ -1,0 +1,3 @@
+action main(pair: (Int, Int)) -> Int:
+  (a, b) := pair
+  return 0

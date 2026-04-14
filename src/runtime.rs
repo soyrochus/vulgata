@@ -11,8 +11,9 @@ use crate::externs::ExternRegistry;
 use crate::resolver::SymbolKind;
 use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
-    TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedStmt,
-    TypedMatchArm, TypedPattern, TypedPatternKind, TypedStmtKind, TypedSymbol, TypedTarget,
+    TypedBindingPattern, TypedBindingPatternKind, TypedCallArg, TypedDecl, TypedExpr,
+    TypedExprKind, TypedIrModule, TypedLiteral, TypedMatchArm, TypedPattern, TypedPatternKind,
+    TypedStmt, TypedStmtKind, TypedSymbol, TypedTarget,
 };
 use crate::types::Type;
 
@@ -408,14 +409,14 @@ impl<'a> Interpreter<'a> {
             TypedStmtKind::RequiresClause(_)
             | TypedStmtKind::EnsuresClause(_)
             | TypedStmtKind::ExampleBlock { .. } => Ok(ExecFlow::Continue),
-            TypedStmtKind::Let { name, ty, value } => {
+            TypedStmtKind::Let { pattern, ty, value } => {
                 let evaluated = coerce_value_to_type(self.eval_expr(value, env)?, ty);
-                env.insert(name.clone(), evaluated);
+                self.bind_declaration_pattern(pattern, evaluated, env)?;
                 Ok(ExecFlow::Continue)
             }
-            TypedStmtKind::Var { name, ty, value } => {
+            TypedStmtKind::Var { pattern, ty, value } => {
                 let evaluated = coerce_value_to_type(self.eval_expr(value, env)?, ty);
-                env.insert(name.clone(), evaluated);
+                self.bind_declaration_pattern(pattern, evaluated, env)?;
                 Ok(ExecFlow::Continue)
             }
             TypedStmtKind::Assign { target, value } => {
@@ -631,6 +632,67 @@ impl<'a> Interpreter<'a> {
             }
         }
         Ok(())
+    }
+
+    fn bind_declaration_pattern(
+        &self,
+        pattern: &TypedBindingPattern,
+        value: Value,
+        env: &mut HashMap<String, Value>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match &pattern.kind {
+            TypedBindingPatternKind::Name(binding) => {
+                env.insert(
+                    binding.name.clone(),
+                    coerce_value_to_type(value.snapshot(), &binding.ty),
+                );
+                Ok(())
+            }
+            TypedBindingPatternKind::Tuple(bindings) => {
+                let Value::List(items) = value else {
+                    return Err(vec![runtime_error(
+                        &pattern.span,
+                        "tuple destructuring expected a tuple runtime value",
+                    )]);
+                };
+                let items = items.borrow();
+                if items.len() != bindings.len() {
+                    return Err(vec![runtime_error(
+                        &pattern.span,
+                        "tuple destructuring arity mismatch at runtime",
+                    )]);
+                }
+                for (binding, item) in bindings.iter().zip(items.iter()) {
+                    env.insert(
+                        binding.name.clone(),
+                        coerce_value_to_type(item.snapshot(), &binding.ty),
+                    );
+                }
+                Ok(())
+            }
+            TypedBindingPatternKind::Record { fields, .. } => {
+                let Value::Record(record) = value else {
+                    return Err(vec![runtime_error(
+                        &pattern.span,
+                        "record destructuring expected a record runtime value",
+                    )]);
+                };
+                let record = record.borrow();
+                for field in fields {
+                    let Some(field_value) = record.get(&field.field) else {
+                        return Err(vec![runtime_error(
+                            &field.span,
+                            format!("record field `{}` is missing during destructuring", field.field),
+                        )]);
+                    };
+                    env.insert(
+                        field.binding.name.clone(),
+                        coerce_value_to_type(field_value.snapshot(), &field.binding.ty),
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     fn match_arm(
@@ -2056,6 +2118,47 @@ action main() -> Int:
         )
         .expect_err("run should fail");
         assert!(diagnostics[0].message.contains("NonExhaustiveMatch"));
+    }
+
+    #[test]
+    fn supports_tuple_and_record_destructuring_in_let_and_var() {
+        let value = run_with_mode(
+            r#"
+record Customer:
+  score: Int
+
+action main() -> Int:
+  let (a, b) = (2, 3)
+  var Customer(score: score) = Customer(score: 5)
+  score := score + a
+  return score + b
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(value, Value::Int(10));
+    }
+
+    #[test]
+    fn destructured_var_bindings_do_not_alias_original_values() {
+        let value = run_with_mode(
+            r#"
+record Address:
+  city: Text
+
+record Customer:
+  address: Address
+
+action main() -> Text:
+  let customer = Customer(address: Address(city: "before"))
+  var Customer(address: current) = customer
+  current.city := "after"
+  return customer.address.city
+"#,
+            ExecutionMode::Checked,
+        )
+        .expect("run");
+        assert_eq!(value, Value::Text("before".to_string()));
     }
 
     #[test]

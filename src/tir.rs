@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    BinaryOp, CallArg, Decl, Expr, ExprKind, Pattern, PatternKind, PatternLiteral,
-    RecordPatternField, Stmt, StmtKind, Target, UnaryOp,
+    BinaryOp, BindingPattern, BindingPatternKind, CallArg, Decl, Expr, ExprKind, Pattern,
+    PatternKind, PatternLiteral, RecordBindingField, RecordPatternField, Stmt, StmtKind, Target,
+    UnaryOp,
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
@@ -113,12 +114,12 @@ pub enum TypedStmtKind {
         outputs: Vec<(String, TypedExpr)>,
     },
     Let {
-        name: String,
+        pattern: TypedBindingPattern,
         ty: Type,
         value: TypedExpr,
     },
     Var {
-        name: String,
+        pattern: TypedBindingPattern,
         ty: Type,
         value: TypedExpr,
     },
@@ -154,6 +155,36 @@ pub enum TypedStmtKind {
 pub struct TypedMatchArm {
     pub pattern: TypedPattern,
     pub body: Vec<TypedStmt>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedBindingPattern {
+    pub kind: TypedBindingPatternKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedBindingPatternKind {
+    Name(TypedBinding),
+    Tuple(Vec<TypedBinding>),
+    Record {
+        name: String,
+        fields: Vec<TypedRecordBindingField>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedBinding {
+    pub name: String,
+    pub ty: Type,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedRecordBindingField {
+    pub field: String,
+    pub binding: TypedBinding,
     pub span: SourceSpan,
 }
 
@@ -486,11 +517,19 @@ fn lower_stmt(checked: &CheckedModule, stmt: &Stmt) -> Result<TypedStmt, Vec<Dia
                 .collect::<Result<Vec<_>, Vec<Diagnostic>>>()?,
         },
         StmtKind::Let {
-            name,
+            pattern,
             explicit_type,
             value,
         } => TypedStmtKind::Let {
-            name: name.clone(),
+            pattern: lower_binding_pattern(
+                checked,
+                pattern,
+                &if let Some(explicit_type) = explicit_type {
+                    lower_type_ref(explicit_type, checked, &stmt.span)?
+                } else {
+                    expr_type(checked, value)?
+                },
+            )?,
             ty: if let Some(explicit_type) = explicit_type {
                 lower_type_ref(explicit_type, checked, &stmt.span)?
             } else {
@@ -499,11 +538,19 @@ fn lower_stmt(checked: &CheckedModule, stmt: &Stmt) -> Result<TypedStmt, Vec<Dia
             value: lower_expr(checked, value)?,
         },
         StmtKind::Var {
-            name,
+            pattern,
             explicit_type,
             value,
         } => TypedStmtKind::Var {
-            name: name.clone(),
+            pattern: lower_binding_pattern(
+                checked,
+                pattern,
+                &if let Some(explicit_type) = explicit_type {
+                    lower_type_ref(explicit_type, checked, &stmt.span)?
+                } else {
+                    expr_type(checked, value)?
+                },
+            )?,
             ty: if let Some(explicit_type) = explicit_type {
                 lower_type_ref(explicit_type, checked, &stmt.span)?
             } else {
@@ -623,6 +670,80 @@ fn lower_target(checked: &CheckedModule, target: &Target) -> Result<TypedTarget,
             span: span.clone(),
         }),
     }
+}
+
+fn lower_binding_pattern(
+    checked: &CheckedModule,
+    pattern: &BindingPattern,
+    whole_type: &Type,
+) -> Result<TypedBindingPattern, Vec<Diagnostic>> {
+    let kind = match &pattern.kind {
+        BindingPatternKind::Name(name) => TypedBindingPatternKind::Name(TypedBinding {
+            name: name.clone(),
+            ty: whole_type.clone(),
+            span: pattern.span.clone(),
+        }),
+        BindingPatternKind::Tuple(names) => {
+            let item_types = match whole_type {
+                Type::Tuple(types) if types.len() == names.len() => types.clone(),
+                Type::Unknown => vec![Type::Unknown; names.len()],
+                other => {
+                    return Err(vec![Diagnostic::new(
+                        pattern.span.clone(),
+                        Phase::Lower,
+                        format!(
+                            "cannot lower tuple destructuring for `{}`",
+                            other.describe()
+                        ),
+                    )]);
+                }
+            };
+            TypedBindingPatternKind::Tuple(
+                names
+                    .iter()
+                    .zip(item_types.iter())
+                    .map(|(name, ty)| TypedBinding {
+                        name: name.clone(),
+                        ty: ty.clone(),
+                        span: pattern.span.clone(),
+                    })
+                    .collect(),
+            )
+        }
+        BindingPatternKind::Record { name, fields } => TypedBindingPatternKind::Record {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|field| lower_record_binding_field(checked, name, field))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+    };
+    Ok(TypedBindingPattern {
+        kind,
+        span: pattern.span.clone(),
+    })
+}
+
+fn lower_record_binding_field(
+    checked: &CheckedModule,
+    record_name: &str,
+    field: &RecordBindingField,
+) -> Result<TypedRecordBindingField, Vec<Diagnostic>> {
+    let ty = checked
+        .records
+        .get(record_name)
+        .and_then(|record| record.fields.get(&field.field))
+        .cloned()
+        .unwrap_or(Type::Unknown);
+    Ok(TypedRecordBindingField {
+        field: field.field.clone(),
+        binding: TypedBinding {
+            name: field.binding.clone(),
+            ty,
+            span: field.span.clone(),
+        },
+        span: field.span.clone(),
+    })
 }
 
 fn lower_pattern(
@@ -1343,6 +1464,53 @@ action main(result: Result[Int, Text]) -> Int:
                 }
                 other => panic!("unexpected statement: {other:?}"),
             },
+            other => panic!("unexpected declaration: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_binding_destructuring_patterns() {
+        let source = r#"
+record Customer:
+  name: Text
+
+action main(pair: (Int, Int), customer: Customer) -> Int:
+  let (left, right) = pair
+  var Customer(name: current) = customer
+  return left
+"#;
+        let path = Path::new("test.vg");
+        let tokens = Lexer::new(path, source).tokenize().expect("tokenize");
+        let module = Parser::new(path, tokens).parse_module().expect("parse");
+        let resolution = Resolver::new(&module).resolve().expect("resolve");
+        let checked = TypeChecker::new(&module, &resolution)
+            .check()
+            .expect("check");
+        let lowered = lower_module(&checked).expect("lower");
+
+        match &lowered.declarations[1] {
+            TypedDecl::Action(action) => {
+                assert!(matches!(
+                    action.body[0].kind,
+                    TypedStmtKind::Let {
+                        pattern: super::TypedBindingPattern {
+                            kind: super::TypedBindingPatternKind::Tuple(_),
+                            ..
+                        },
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    action.body[1].kind,
+                    TypedStmtKind::Var {
+                        pattern: super::TypedBindingPattern {
+                            kind: super::TypedBindingPatternKind::Record { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ));
+            }
             other => panic!("unexpected declaration: {other:?}"),
         }
     }

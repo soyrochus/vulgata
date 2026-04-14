@@ -1,0 +1,11 @@
+record Address:
+  city: Text
+
+record Customer:
+  address: Address
+
+action main() -> Text:
+  let customer = Customer(address: Address(city: "before"))
+  var Customer(address: current) = customer
+  current.city := "after"
+  return customer.address.city

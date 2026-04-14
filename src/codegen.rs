@@ -5,8 +5,9 @@ use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::SymbolKind;
 use crate::standard_runtime::{self, StandardRuntimeAction};
 use crate::tir::{
-    TypedCallArg, TypedDecl, TypedExpr, TypedExprKind, TypedIrModule, TypedLiteral, TypedMatchArm,
-    TypedPattern, TypedPatternKind, TypedStmt, TypedStmtKind, TypedSymbol, TypedTarget,
+    TypedBindingPattern, TypedBindingPatternKind, TypedCallArg, TypedDecl, TypedExpr,
+    TypedExprKind, TypedIrModule, TypedLiteral, TypedMatchArm, TypedPattern, TypedPatternKind,
+    TypedStmt, TypedStmtKind, TypedSymbol, TypedTarget,
 };
 use crate::types::Type;
 
@@ -280,18 +281,12 @@ fn lower_stmt(
     return_type: &Type,
 ) -> Result<RustStmt, Vec<Diagnostic>> {
     let lowered = match &stmt.kind {
-        TypedStmtKind::Let { name, ty, value } => RustStmt::Let {
-            name: name.clone(),
-            ty: Some(lower_storage_type(ty, &stmt.span)?),
-            value: coerce_expr_to_type(lower_expr(value)?, &value.ty, ty),
-            mutable: false,
-        },
-        TypedStmtKind::Var { name, ty, value } => RustStmt::Let {
-            name: name.clone(),
-            ty: Some(lower_storage_type(ty, &stmt.span)?),
-            value: coerce_expr_to_type(lower_expr(value)?, &value.ty, ty),
-            mutable: reassigned.contains(name),
-        },
+        TypedStmtKind::Let { pattern, ty, value } => {
+            lower_declaration_binding(pattern, ty, value, false, reassigned, &stmt.span)?
+        }
+        TypedStmtKind::Var { pattern, ty, value } => {
+            lower_declaration_binding(pattern, ty, value, true, reassigned, &stmt.span)?
+        }
         TypedStmtKind::Assign { target, value } => lower_assignment(target, value)?,
         TypedStmtKind::If {
             branches,
@@ -528,6 +523,82 @@ fn lower_assignment(target: &TypedTarget, value: &TypedExpr) -> Result<RustStmt,
             }
         }
     }
+}
+
+fn lower_declaration_binding(
+    pattern: &TypedBindingPattern,
+    whole_type: &Type,
+    value: &TypedExpr,
+    is_var: bool,
+    reassigned: &HashSet<String>,
+    span: &SourceSpan,
+) -> Result<RustStmt, Vec<Diagnostic>> {
+    match &pattern.kind {
+        TypedBindingPatternKind::Name(binding) => Ok(RustStmt::Let {
+            name: binding.name.clone(),
+            ty: Some(lower_storage_type(&binding.ty, span)?),
+            value: coerce_expr_to_type(lower_expr(value)?, &value.ty, whole_type),
+            mutable: is_var && reassigned.contains(&binding.name),
+        }),
+        TypedBindingPatternKind::Tuple(bindings) => {
+            let temp_name = destructure_temp_name(span);
+            let mut lines = vec![format!(
+                "let {temp_name}: {} = {};",
+                render_type(&lower_storage_type(whole_type, span)?),
+                render_expr(&coerce_expr_to_type(lower_expr(value)?, &value.ty, whole_type))
+            )];
+            for (index, binding) in bindings.iter().enumerate() {
+                lines.push(render_destructure_binding(
+                    &binding.name,
+                    &binding.ty,
+                    &format!("{temp_name}.{index}"),
+                    is_var && reassigned.contains(&binding.name),
+                    span,
+                )?);
+            }
+            Ok(RustStmt::Raw(lines.join("\n")))
+        }
+        TypedBindingPatternKind::Record { fields, .. } => {
+            let temp_name = destructure_temp_name(span);
+            let mut lines = vec![format!(
+                "let {temp_name}: {} = {};",
+                render_type(&lower_storage_type(whole_type, span)?),
+                render_expr(&coerce_expr_to_type(lower_expr(value)?, &value.ty, whole_type))
+            )];
+            for field in fields {
+                lines.push(render_destructure_binding(
+                    &field.binding.name,
+                    &field.binding.ty,
+                    &format!("{temp_name}.borrow().{}", field.field),
+                    is_var && reassigned.contains(&field.binding.name),
+                    span,
+                )?);
+            }
+            Ok(RustStmt::Raw(lines.join("\n")))
+        }
+    }
+}
+
+fn render_destructure_binding(
+    name: &str,
+    ty: &Type,
+    source_expr: &str,
+    mutable: bool,
+    span: &SourceSpan,
+) -> Result<String, Vec<Diagnostic>> {
+    let mutability = if mutable { "mut " } else { "" };
+    Ok(format!(
+        "let {mutability}{name}: {} = support::snapshot(&{source_expr});",
+        render_type(&lower_storage_type(ty, span)?)
+    ))
+}
+
+fn destructure_temp_name(span: &SourceSpan) -> String {
+    format!(
+        "__vulgata_destructure_{}_{}",
+        span.line.max(1),
+        span.column.max(1)
+    )
 }
 
 fn coerce_expr_to_type(expr: RustExpr, actual: &Type, expected: &Type) -> RustExpr {
@@ -1906,5 +1977,29 @@ action main() -> Text:
         assert!(emitted.contains("match "));
         assert!(emitted.contains("Decision::Accept { reason: reason }"));
         assert!(emitted.contains("panic!(\"NonExhaustiveMatch\")"));
+    }
+
+    #[test]
+    fn emits_destructuring_bindings_with_one_time_temporaries() {
+        let module = lower(
+            r#"
+record Customer:
+  score: Int
+
+action main(pair: (Int, Int), customer: Customer) -> Int:
+  let (left, right) = pair
+  var Customer(score: score) = customer
+  score := score + left
+  return score + right
+"#,
+        );
+
+        let lowered = lower_module(&module).expect("codegen lower");
+        let emitted = emit_module(&lowered);
+
+        assert!(emitted.contains("__vulgata_destructure_"));
+        assert!(emitted.contains("support::snapshot(&"));
+        assert!(emitted.contains(".0"));
+        assert!(emitted.contains(".borrow().score"));
     }
 }

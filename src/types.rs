@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    AstModule, BinaryOp, CallArg, Decl, Expr, ExprKind, MatchArm, Param, Pattern, PatternKind,
-    PatternLiteral, Purity, RecordPatternField, Stmt, StmtKind, Target, TypeRef, UnaryOp,
+    AstModule, BinaryOp, BindingPattern, BindingPatternKind, CallArg, Decl, Expr, ExprKind,
+    MatchArm, Param, Pattern, PatternKind, PatternLiteral, Purity, RecordBindingField,
+    RecordPatternField, Stmt, StmtKind, Target, TypeRef, UnaryOp,
 };
 use crate::diagnostics::{Diagnostic, Phase, SourceSpan};
 use crate::resolver::{Resolution, SymbolKind};
@@ -317,7 +318,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             StmtKind::Let {
-                name,
+                pattern,
                 explicit_type,
                 value,
             } => {
@@ -327,10 +328,10 @@ impl<'a> TypeChecker<'a> {
                     if !is_assignable(&declared, &value_type) {
                         return Err(vec![type_error(
                             &value.span,
-                            format!(
-                                "variable `{name}` expected type `{}`, found `{}`",
-                                declared.describe(),
-                                value_type.describe()
+                            declaration_type_mismatch_message(
+                                pattern,
+                                &declared,
+                                &value_type,
                             ),
                         )]);
                     }
@@ -338,10 +339,10 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     value_type
                 };
-                scope.insert(name.clone(), declared_type, false);
+                self.bind_declaration_pattern(pattern, &declared_type, false, scope)?;
             }
             StmtKind::Var {
-                name,
+                pattern,
                 explicit_type,
                 value,
             } => {
@@ -351,10 +352,10 @@ impl<'a> TypeChecker<'a> {
                     if !is_assignable(&declared, &value_type) {
                         return Err(vec![type_error(
                             &value.span,
-                            format!(
-                                "variable `{name}` expected type `{}`, found `{}`",
-                                declared.describe(),
-                                value_type.describe()
+                            declaration_type_mismatch_message(
+                                pattern,
+                                &declared,
+                                &value_type,
                             ),
                         )]);
                     }
@@ -362,7 +363,7 @@ impl<'a> TypeChecker<'a> {
                 } else {
                     value_type
                 };
-                scope.insert(name.clone(), declared_type, true);
+                self.bind_declaration_pattern(pattern, &declared_type, true, scope)?;
             }
             StmtKind::Assign { target, value } => {
                 let target_type = self.type_target(target, scope, in_test)?;
@@ -540,6 +541,131 @@ impl<'a> TypeChecker<'a> {
             expected_return,
             loop_depth,
         )
+    }
+
+    fn bind_declaration_pattern(
+        &self,
+        pattern: &BindingPattern,
+        value_type: &Type,
+        mutable: bool,
+        scope: &mut Scope,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut seen = HashMap::new();
+        self.validate_declaration_pattern(pattern, value_type, &mut seen)?;
+        for (name, ty) in seen {
+            scope.insert(name, ty, mutable);
+        }
+        Ok(())
+    }
+
+    fn validate_declaration_pattern(
+        &self,
+        pattern: &BindingPattern,
+        value_type: &Type,
+        seen: &mut HashMap<String, Type>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match &pattern.kind {
+            BindingPatternKind::Name(name) => {
+                self.insert_decl_binding(name, value_type.clone(), &pattern.span, seen)
+            }
+            BindingPatternKind::Tuple(names) => match value_type {
+                Type::Tuple(items) if items.len() == names.len() => {
+                    for (name, item_type) in names.iter().zip(items.iter()) {
+                        self.insert_decl_binding(name, item_type.clone(), &pattern.span, seen)?;
+                    }
+                    Ok(())
+                }
+                Type::Tuple(items) => Err(vec![type_error(
+                    &pattern.span,
+                    format!(
+                        "tuple destructuring expects {} element(s), found {}",
+                        names.len(),
+                        items.len()
+                    ),
+                )]),
+                Type::Unknown => {
+                    for name in names {
+                        self.insert_decl_binding(name, Type::Unknown, &pattern.span, seen)?;
+                    }
+                    Ok(())
+                }
+                other => Err(vec![type_error(
+                    &pattern.span,
+                    format!(
+                        "tuple destructuring requires a tuple value, found `{}`",
+                        other.describe()
+                    ),
+                )]),
+            },
+            BindingPatternKind::Record { name, fields } => {
+                let record = self.records.get(name).ok_or_else(|| {
+                    vec![type_error(
+                        &pattern.span,
+                        format!("unknown record type `{name}` in destructuring"),
+                    )]
+                })?;
+
+                match value_type {
+                    Type::Record(actual_name) if actual_name == name => {}
+                    Type::Unknown => {}
+                    Type::Record(actual_name) => {
+                        return Err(vec![type_error(
+                            &pattern.span,
+                            format!(
+                                "record destructuring `{name}` does not match `{actual_name}`"
+                            ),
+                        )]);
+                    }
+                    other => {
+                        return Err(vec![type_error(
+                            &pattern.span,
+                            format!(
+                                "record destructuring requires `{name}`, found `{}`",
+                                other.describe()
+                            ),
+                        )]);
+                    }
+                }
+
+                for field in fields {
+                    self.validate_record_binding_field(field, name, record, seen)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_record_binding_field(
+        &self,
+        field: &RecordBindingField,
+        record_name: &str,
+        record: &RecordType,
+        seen: &mut HashMap<String, Type>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let field_type = record.fields.get(&field.field).ok_or_else(|| {
+            vec![type_error(
+                &field.span,
+                format!("record `{record_name}` has no field `{}`", field.field),
+            )]
+        })?;
+        self.insert_decl_binding(&field.binding, field_type.clone(), &field.span, seen)
+    }
+
+    fn insert_decl_binding(
+        &self,
+        name: &str,
+        ty: Type,
+        span: &SourceSpan,
+        seen: &mut HashMap<String, Type>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        if seen.contains_key(name) {
+            return Err(vec![type_error(
+                span,
+                format!("duplicate binding `{name}` in destructuring declaration"),
+            )]);
+        }
+        seen.insert(name.to_string(), ty);
+        Ok(())
     }
 
     fn check_pattern(
@@ -1549,47 +1675,15 @@ pub fn check_statement(
 
     let binding = match &stmt.kind {
         StmtKind::Let {
-            name,
+            pattern,
             explicit_type,
             value,
-        } => Some((
-            name.clone(),
-            ReplBinding {
-                ty: if let Some(explicit_type) = explicit_type {
-                    checker.lower_type_ref(explicit_type, &stmt.span)?
-                } else {
-                    checker.expr_types.get(&value.id).cloned().ok_or_else(|| {
-                        vec![Diagnostic::new(
-                            value.span.clone(),
-                            Phase::TypeCheck,
-                            "missing inferred type for repl binding",
-                        )]
-                    })?
-                },
-                mutable: false,
-            },
-        )),
+        } => repl_decl_binding(&checker, pattern, explicit_type.as_ref(), value, &stmt.span, false)?,
         StmtKind::Var {
-            name,
+            pattern,
             explicit_type,
             value,
-        } => Some((
-            name.clone(),
-            ReplBinding {
-                ty: if let Some(explicit_type) = explicit_type {
-                    checker.lower_type_ref(explicit_type, &stmt.span)?
-                } else {
-                    checker.expr_types.get(&value.id).cloned().ok_or_else(|| {
-                        vec![Diagnostic::new(
-                            value.span.clone(),
-                            Phase::TypeCheck,
-                            "missing inferred type for repl binding",
-                        )]
-                    })?
-                },
-                mutable: true,
-            },
-        )),
+        } => repl_decl_binding(&checker, pattern, explicit_type.as_ref(), value, &stmt.span, true)?,
         StmtKind::Assign { .. } | StmtKind::Expr(_) => None,
         _ => None,
     };
@@ -1600,6 +1694,36 @@ pub fn check_statement(
         target_root_mutability: checker.target_root_mutability,
         binding,
     })
+}
+
+fn repl_decl_binding(
+    checker: &TypeChecker<'_>,
+    pattern: &BindingPattern,
+    explicit_type: Option<&TypeRef>,
+    value: &Expr,
+    span: &SourceSpan,
+    mutable: bool,
+) -> Result<Option<(String, ReplBinding)>, Vec<Diagnostic>> {
+    let BindingPatternKind::Name(name) = &pattern.kind else {
+        return Ok(None);
+    };
+
+    let ty = if let Some(explicit_type) = explicit_type {
+        checker.lower_type_ref(explicit_type, span)?
+    } else {
+        checker.expr_types.get(&value.id).cloned().ok_or_else(|| {
+            vec![Diagnostic::new(
+                value.span.clone(),
+                Phase::TypeCheck,
+                "missing inferred type for repl binding",
+            )]
+        })?
+    };
+
+    Ok(Some((
+        name.clone(),
+        ReplBinding { ty, mutable },
+    )))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1833,6 +1957,25 @@ fn builtin_result_or_option_call_type(
     };
 
     Ok(result_type)
+}
+
+fn declaration_type_mismatch_message(
+    pattern: &BindingPattern,
+    expected: &Type,
+    actual: &Type,
+) -> String {
+    match &pattern.kind {
+        BindingPatternKind::Name(name) => format!(
+            "variable `{name}` expected type `{}`, found `{}`",
+            expected.describe(),
+            actual.describe()
+        ),
+        _ => format!(
+            "binding declaration expected type `{}`, found `{}`",
+            expected.describe(),
+            actual.describe()
+        ),
+    }
 }
 
 fn describe_pattern_literal(literal: &PatternLiteral) -> String {
@@ -2097,5 +2240,63 @@ action main(result: Result[Int, Text]) -> Int:
         .expect_err("check should fail");
         assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::Resolve);
         assert!(diagnostics[0].message.contains("unresolved symbol `value`"));
+    }
+
+    #[test]
+    fn rejects_tuple_destructuring_arity_mismatch() {
+        let diagnostics = check(
+            r#"
+action main(pair: (Int, Int, Int)) -> Int:
+  let (a, b) = pair
+  return a
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(diagnostics[0].message.contains("tuple destructuring expects 2 element(s)"));
+    }
+
+    #[test]
+    fn rejects_record_destructuring_wrong_nominal_type() {
+        let diagnostics = check(
+            r#"
+record Customer:
+  name: Text
+
+record Supplier:
+  name: Text
+
+action main(supplier: Supplier) -> Text:
+  let Customer(name: name) = supplier
+  return name
+"#,
+        )
+        .expect_err("check should fail");
+        assert_eq!(diagnostics[0].phase, crate::diagnostics::Phase::TypeCheck);
+        assert!(diagnostics[0].message.contains("record destructuring `Customer` does not match `Supplier`"));
+    }
+
+    #[test]
+    fn destructured_names_inherit_let_vs_var_mutability() {
+        let let_diagnostics = check(
+            r#"
+action main(pair: (Int, Int)) -> Int:
+  let (a, b) = pair
+  a := 1
+  return b
+"#,
+        )
+        .expect_err("check should fail");
+        assert!(let_diagnostics[0].message.contains("cannot assign to immutable binding `a`"));
+
+        check(
+            r#"
+action main(pair: (Int, Int)) -> Int:
+  var (a, b) = pair
+  a := 1
+  return a
+"#,
+        )
+        .expect("check should succeed");
     }
 }

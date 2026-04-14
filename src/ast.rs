@@ -195,12 +195,12 @@ pub enum StmtKind {
         outputs: Vec<(String, Expr)>,
     },
     Let {
-        name: String,
+        pattern: BindingPattern,
         explicit_type: Option<TypeRef>,
         value: Expr,
     },
     Var {
-        name: String,
+        pattern: BindingPattern,
         explicit_type: Option<TypeRef>,
         value: Expr,
     },
@@ -243,6 +243,29 @@ pub struct ConditionalBranch {
 pub struct MatchArm {
     pub pattern: Pattern,
     pub body: Vec<Stmt>,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindingPattern {
+    pub kind: BindingPatternKind,
+    pub span: SourceSpan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindingPatternKind {
+    Name(String),
+    Tuple(Vec<String>),
+    Record {
+        name: String,
+        fields: Vec<RecordBindingField>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordBindingField {
+    pub field: String,
+    pub binding: String,
     pub span: SourceSpan,
 }
 
