@@ -1,1 +1,6 @@
 /target
+
+# local config
+
+.claude/skills/vulgata-lang
+.github/skills/vulgata-lang

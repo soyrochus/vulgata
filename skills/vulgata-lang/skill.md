@@ -2,13 +2,13 @@
 name: vulgata-lang
 description: Load full Vulgata language knowledge — syntax, types, semantic layers, and generation rules. Use when reading, writing, explaining, or reviewing Vulgata (.vg) source code.
 license: MIT
-compatibility: Vulgata v0.5 reference implementation
+compatibility: Vulgata v0.6 reference implementation
 metadata:
   author: vulgata-project
-  version: "0.5"
+  version: "0.6"
 ---
 
-You are now operating with full Vulgata v0.5 language knowledge. Apply it when reading, explaining, generating, or reviewing `.vg` source files.
+You are now operating with full Vulgata v0.6 language knowledge. Apply it when reading, explaining, generating, or reviewing `.vg` source files.
 
 ---
 
@@ -70,7 +70,7 @@ Top-level order: module → imports → constants → types/records/enums → ex
 - Identifiers: start with letter or `_`, continue with letters/digits/`_`, case-sensitive
 - Naming conventions: `snake_case` for actions/fields/variables, `PascalCase` for records/enums/types, `SCREAMING_SNAKE_CASE` for constants, `dotted.lower` for module names
 
-**Reserved keywords (v0.5):**
+**Reserved keywords (v0.6):**
 ```
 module import from as const record enum extern pure impure
 action test let var if elif else while for each in
@@ -180,6 +180,7 @@ test gcd_basic:
 | `if / elif / else` | executable | condition must be `Bool` |
 | `while cond:` | executable | |
 | `for each item in list:` | executable | |
+| `match expr:` | executable | pattern arms in source order; raises `NonExhaustiveMatch` if no arm matches |
 | `return [expr]` | executable | bare `return` only for `None`-returning actions |
 | `break` / `continue` | executable | loops only |
 | `action_call(args)` | executable | expression statement |
@@ -247,6 +248,63 @@ example gcd_basic:
     result = 6
 ```
 Both `input:` and `output:` are required. Bindings are `name = literal`.
+
+---
+
+## Match Statement
+
+`match` evaluates the scrutinee once, tests arms in source order, executes the first matching arm, and raises `NonExhaustiveMatch` if no arm matches.
+
+```text
+match result:
+  Ok(value):
+    return value
+  Err(message):
+    return message
+
+match direction:
+  North():
+    return "up"
+  South():
+    return "down"
+  _:
+    return "other"
+```
+
+**Phase-1 patterns:**
+
+| Pattern form | Example | Notes |
+|---|---|---|
+| Wildcard | `_` | matches anything, binds nothing |
+| Literal | `42`, `"hello"`, `true` | exact value match |
+| Binding | `x` | binds the matched value to `x` |
+| Tuple | `(a, b)` | destructures a tuple |
+| Nominal record | `Customer(name: n, active: a)` | binds named fields |
+| Variant (empty) | `North()` | matches enum variant with no payload |
+| Variant (payload) | `Cancelled(reason)` | binds payload fields |
+
+Pattern rules:
+- Arms are tested in source order; the first match wins
+- `_` (wildcard) should appear last as a catch-all
+- Enum empty variants must be matched as `VariantName()`, not bare identifiers
+- Nested patterns are not yet supported beyond what is listed above
+
+---
+
+## Destructuring in let / var
+
+Tuple and nominal-record destructuring are supported in `let` and `var` declarations:
+
+```text
+let (left, right) = pair
+var Customer(name: current_name, active: current_active) = customer
+```
+
+Rules:
+- Only tuple and nominal record forms are allowed in declarations
+- Destructured outputs must be plain identifiers (no nesting)
+- Wildcard and enum-style destructuring are rejected in `let` / `var`
+- Destructuring in `:=` (assignment) is rejected
 
 ---
 
@@ -318,7 +376,7 @@ Mutating a `var`-rooted value must not implicitly mutate any value visible throu
 
 ## Standard Library
 
-Vulgata v0.5 ships two implemented modules: `console` and `file`. All I/O returns `Result[T, Text]`.
+Vulgata v0.6 ships two implemented modules: `console` and `file`. All I/O returns `Result[T, Text]`.
 
 ### `console` module
 
@@ -341,17 +399,40 @@ file.append_text(path: Text, content: Text) -> Result[None, Text]  # append (cre
 file.exists(path: Text) -> Bool                               # check file presence
 ```
 
-### Using `Result`
+### Using `Result` and `Option`
 
-There is no exception system. All fallible operations return `Result[T, E]`. Unwrap with helper methods or branch explicitly:
+There is no exception system. All fallible operations return `Result[T, E]`. Use built-in member operations or `match` to handle them:
+
+**`Result[T, E]` operations** (no import needed):
+- `is_ok()` → `Bool`
+- `is_err()` → `Bool`
+- `value()` → `T` (runtime error if called on `Err`)
+- `error()` → `E` (runtime error if called on `Ok`)
+
+**`Option[T]` operations** (no import needed):
+- `is_some()` → `Bool`
+- `is_none()` → `Bool`
+- `value()` → `T` (runtime error if called on `None`)
+
+Branch explicitly:
 
 ```text
 let res = file.read_text("config.txt")
 if res.is_ok():
-  let content = res.unwrap()
+  let content = res.value()
   let _ = console.println(content)
 else:
   let _ = console.eprintln("could not read file")
+```
+
+Or use `match`:
+
+```text
+match file.read_text("config.txt"):
+  Ok(content):
+    let _ = console.println(content)
+  Err(msg):
+    let _ = console.eprintln(msg)
 ```
 
 Discard an unwanted `Result` return value by binding it to `_`:
@@ -406,6 +487,11 @@ When writing Vulgata source, follow these rules:
 17. **All stdlib I/O returns `Result[T, Text]`.** Always handle or discard with `let _ = ...`.
 18. **There is no `print` statement.** Use `console.println(...)`.
 19. **Positional call arguments must come before named ones.** Once you use a named arg, all remaining args must be named.
+20. **`Result` and `Option` use `.value()`, not `.unwrap()`.** The correct extraction method is `.value()`. `.error()` extracts the error side of a `Result`.
+21. **`match` arms are tested in source order; include a wildcard `_:` arm last** when exhaustive matching is not guaranteed.
+22. **Empty enum variants in `match` require `()`: write `North()`, not `North`.**
+23. **Destructuring in `:=` is rejected.** Only `let` and `var` declarations support tuple and nominal-record destructuring.
+24. **Destructured identifiers must be plain names.** Nested or wildcard destructuring is not supported in `let`/`var`.
 
 ---
 

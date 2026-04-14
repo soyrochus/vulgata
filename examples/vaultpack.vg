@@ -7,39 +7,105 @@ const FORMAT: Text = "vaultpack"
 
 record CliOptions:
   source_path: Text
+    meaning: "Source file used by the self-contained vaultpack demo"
   archive_path: Text
+    meaning: "Target file written by the demo archive pipeline"
   force: Bool
+    meaning: "Allow overwriting an existing archive file"
 
 record Bundle:
   source_path: Text
+    meaning: "Original source path copied into the archive bundle"
   archive_text: Text
+    meaning: "Serialized archive payload used by the simplified demo"
 
 record Summary:
   source_path: Text
+    meaning: "Source file that was packed"
   archive_path: Text
+    meaning: "Output path that received the archive payload"
   bytes_written: Int
+    meaning: "Demo byte count reported by the simplified writer"
   mode: Text
+    meaning: "Human-readable mode label derived from the pack mode"
 
 enum PackMode:
   Plain
   Forced
 
 action parse_default_options() -> CliOptions:
+  intent:
+    goal: "Provide a deterministic local configuration for the demo"
+    assumptions:
+      - "README.md exists in the repository root"
+    properties:
+      - "No user input is required"
   return CliOptions(source_path: "README.md", archive_path: "vaultpack.out", force: true)
 
 action classify_mode(force: Bool) -> PackMode:
+  intent:
+    goal: "Map overwrite intent to a pack mode"
   if force:
     return Forced
   return Plain
 
 action mode_name(mode: PackMode) -> Text:
+  intent:
+    goal: "Render a stable textual label for a pack mode"
   match mode:
     Plain():
       return "plain"
     Forced():
       return "forced"
 
+action normalize_exit_code(code: Int) -> Int:
+  intent:
+    goal: "Clamp demo exit codes into the supported CLI range"
+    constraints:
+      - "Exit codes stay within 0..2"
+    properties:
+      - "Negative codes become 1"
+      - "Codes above 2 become 2"
+  explain:
+    "The demo only exposes success, recoverable failure, and usage failure."
+    "Out-of-range values are folded into that small public contract."
+  requires code >= -99
+
+  example preserves_success:
+    input:
+      code = 0
+    output:
+      result = 0
+
+  example preserves_recoverable_failure:
+    input:
+      code = 1
+    output:
+      result = 1
+
+  example caps_large_codes:
+    input:
+      code = 7
+    output:
+      result = 2
+
+  if code < 0:
+    return 1
+  if code > 2:
+    return 2
+  ensures result >= 0
+  ensures result <= 2
+  return code
+
 action validate(options: CliOptions) -> Result[PackMode, Text]:
+  intent:
+    goal: "Reject obviously invalid archive requests before file work begins"
+    constraints:
+      - "The source file must exist"
+      - "An existing output path requires force mode"
+  requires options.source_path != ""
+  requires options.archive_path != ""
+
   if not file.exists(options.source_path):
     return Err("source does not exist")
 
@@ -49,6 +115,15 @@ action validate(options: CliOptions) -> Result[PackMode, Text]:
   return Ok(classify_mode(options.force))
 
 action build_bundle(options: CliOptions) -> Result[Bundle, Text]:
+  intent:
+    goal: "Materialize the simplified single-file bundle"
+    assumptions:
+      - "The source file is text-readable"
+    properties:
+      - "The bundle keeps the original source path"
+  explain:
+    "This example intentionally avoids externs and collection helpers."
+    "Its job is to show language features, not production archiving."
   match file.read_text(options.source_path):
     Ok(contents):
       return Ok(Bundle(source_path: options.source_path, archive_text: contents))
@@ -56,6 +131,8 @@ action build_bundle(options: CliOptions) -> Result[Bundle, Text]:
       return Err(e)
 
 action write_archive(bundle: Bundle, options: CliOptions, mode: PackMode) -> Result[Summary, Text]:
+  intent:
+    goal: "Write the generated archive text and report a summary"
   match file.write_text(options.archive_path, bundle.archive_text):
     Ok(_):
       return Ok(Summary(source_path: bundle.source_path, archive_path: options.archive_path, bytes_written: 1, mode: mode_name(mode)))
@@ -63,26 +140,42 @@ action write_archive(bundle: Bundle, options: CliOptions, mode: PackMode) -> Res
       return Err(e)
 
 action run(options: CliOptions) -> Result[Summary, Text]:
-  match validate(options):
-    Ok(mode):
-      match build_bundle(options):
-        Ok(bundle):
-          return write_archive(bundle, options, mode)
-        Err(e):
-          return Err(e)
-    Err(e):
-      return Err(e)
+  intent:
+    goal: "Execute the simplified vaultpack pipeline with explicit pattern handling"
+    constraints:
+      - "Validation happens before bundle creation"
+      - "Archive writing happens only after a bundle exists"
+    assumptions:
+      - "The demo works on a single repository file"
+    properties:
+      - "All Result branching is expressed with match"
+      - "Successful output includes a structured summary"
+
+  step validate_input:
+    match validate(options):
+      Ok(mode):
+        step build_archive_bundle:
+          match build_bundle(options):
+            Ok(bundle):
+              step persist_archive:
+                return write_archive(bundle, options, mode)
+            Err(e):
+              return Err(e)
+      Err(e):
+        return Err(e)
 
 action main() -> Int:
+  intent:
+    goal: "Run the demo archiver and emit a stable CLI exit code"
   let options = parse_default_options()
   match run(options):
     Ok(summary):
       let Summary(archive_path: out, mode: selected_mode) = summary
       let printed = console.println(out)
-      return 0
+      return normalize_exit_code(0)
     Err(e):
       let reported = console.eprintln(e)
-      return 1
+      return normalize_exit_code(1)
 
 test match_result_ok:
   let result: Result[Int, Text] = Ok(42)
@@ -125,6 +218,11 @@ test mode_match_and_record_destructure:
   let Summary(archive_path: output_path, mode: output_mode) = summary
   expect output_path == "archive.vpk"
   expect output_mode == "forced"
+
+test semantic_helper_contracts_and_examples:
+  expect normalize_exit_code(0) == 0
+  expect normalize_exit_code(-3) == 1
+  expect normalize_exit_code(7) == 2
 
 test mutation_rules:
   var count = 1
