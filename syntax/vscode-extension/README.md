@@ -21,14 +21,15 @@ vscode-extension/
 
 ## Run Locally In VS Code
 
-1. Open this folder in VS Code:
+You must open the `syntax/vscode-extension` directory as the VS Code **workspace root** (not just browse to it inside a larger workspace). There are two ways to do this:
 
-   ```text
-   syntax/vscode-extension
-   ```
+- From the terminal: `code syntax/vscode-extension`
+- From VS Code: **File → Open Folder…** and select the `syntax/vscode-extension` directory.
 
-2. Press `F5` to launch an Extension Development Host.
-3. In the new window, open any `.vg` file such as `examples/sort.vg` from the main repo.
+Once that folder is your workspace root:
+
+1. Press `F5`. VS Code will read `.vscode/launch.json` and start an **Extension Development Host** with the Vulgata extension loaded.
+2. In the new window, open any `.vg` file — for example `examples/sort.vg` from the main repo — and syntax highlighting will be active.
 
 ## Package As A `.vsix`
 
