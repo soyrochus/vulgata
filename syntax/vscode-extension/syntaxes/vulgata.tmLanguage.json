@@ -1,0 +1,313 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Vulgata",
+  "scopeName": "source.vulgata",
+  "fileTypes": [
+    "vg"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#semantic"
+    },
+    {
+      "include": "#control"
+    },
+    {
+      "include": "#bindings"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#members"
+    },
+    {
+      "include": "#calls"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.vulgata",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.vulgata",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.vulgata"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.vulgata"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.vulgata",
+              "match": "\\\\(?:[nt\"\\\\])"
+            }
+          ]
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "meta.declaration.module.vulgata",
+          "match": "^(\\s*)(module)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\b",
+          "captures": {
+            "2": {
+              "name": "keyword.declaration.module.vulgata"
+            },
+            "3": {
+              "name": "entity.name.namespace.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.import.vulgata",
+          "match": "^(\\s*)(import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?\\b",
+          "captures": {
+            "2": {
+              "name": "keyword.control.import.vulgata"
+            },
+            "3": {
+              "name": "entity.name.namespace.vulgata"
+            },
+            "4": {
+              "name": "keyword.control.import.vulgata"
+            },
+            "5": {
+              "name": "entity.name.namespace.alias.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.import.from.vulgata",
+          "match": "^(\\s*)(from)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\s+(import)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?\\b",
+          "captures": {
+            "2": {
+              "name": "keyword.control.import.vulgata"
+            },
+            "3": {
+              "name": "entity.name.namespace.vulgata"
+            },
+            "4": {
+              "name": "keyword.control.import.vulgata"
+            },
+            "5": {
+              "name": "entity.name.namespace.vulgata"
+            },
+            "6": {
+              "name": "keyword.control.import.vulgata"
+            },
+            "7": {
+              "name": "entity.name.namespace.alias.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.record.vulgata",
+          "match": "^(\\s*)(record|enum)\\s+([A-Z][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "2": {
+              "name": "keyword.declaration.type.vulgata"
+            },
+            "3": {
+              "name": "entity.name.type.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.action.vulgata",
+          "match": "^(\\s*)((?:extern)\\s+)?((?:pure|impure)\\s+)?(action)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "2": {
+              "name": "storage.modifier.vulgata"
+            },
+            "3": {
+              "name": "storage.modifier.vulgata"
+            },
+            "4": {
+              "name": "keyword.declaration.function.vulgata"
+            },
+            "5": {
+              "name": "entity.name.function.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.test.vulgata",
+          "match": "^(\\s*)(test)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "2": {
+              "name": "keyword.declaration.test.vulgata"
+            },
+            "3": {
+              "name": "entity.name.function.test.vulgata"
+            }
+          }
+        },
+        {
+          "name": "meta.declaration.const.vulgata",
+          "match": "^(\\s*)(const)\\s+([A-Za-z_][A-Za-z0-9_]*)\\b",
+          "captures": {
+            "2": {
+              "name": "storage.modifier.vulgata"
+            },
+            "3": {
+              "name": "entity.name.constant.vulgata"
+            }
+          }
+        },
+        {
+          "name": "variable.other.member.vulgata",
+          "match": "^(\\s+)([A-Za-z_][A-Za-z0-9_]*)(?=\\s*:)"
+        }
+      ]
+    },
+    "semantic": {
+      "patterns": [
+        {
+          "name": "keyword.other.semantic.vulgata",
+          "match": "\\b(intent|meaning|explain|step|requires|ensures|example|goal|constraints|assumptions|properties|input|output)\\b"
+        }
+      ]
+    },
+    "control": {
+      "patterns": [
+        {
+          "name": "keyword.control.vulgata",
+          "match": "\\b(module|import|from|as|if|elif|else|while|for|each|in|return|break|continue|expect|and|or|not)\\b"
+        }
+      ]
+    },
+    "bindings": {
+      "patterns": [
+        {
+          "name": "storage.modifier.vulgata",
+          "match": "\\b(let|var|extern|pure|impure|const)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.vulgata",
+          "match": "\\b(true|false|none)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.builtin.vulgata",
+          "match": "\\b(Bool|Int|Dec|Text|Bytes|None|List|Map|Set|Option|Result)\\b"
+        },
+        {
+          "name": "entity.name.type.vulgata",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "members": {
+      "patterns": [
+        {
+          "name": "variable.other.property.vulgata",
+          "match": "(?<=\\.)[A-Za-z_][A-Za-z0-9_]*\\b"
+        },
+        {
+          "name": "variable.parameter.vulgata",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*:)"
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "name": "support.function.vulgata",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b(?=\\()"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.vulgata",
+          "match": "\\b\\d+\\.\\d+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.vulgata",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.vulgata",
+          "match": ":=|="
+        },
+        {
+          "name": "keyword.operator.arrow.vulgata",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.comparison.vulgata",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.arithmetic.vulgata",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "punctuation.separator.key-value.vulgata",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.separator.sequence.vulgata",
+          "match": ","
+        },
+        {
+          "name": "punctuation.accessor.vulgata",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.section.brackets.begin.vulgata",
+          "match": "[\\[\\(\\{]"
+        },
+        {
+          "name": "punctuation.section.brackets.end.vulgata",
+          "match": "[\\]\\)\\}]"
+        }
+      ]
+    }
+  }
+}

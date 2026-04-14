@@ -1,0 +1,53 @@
+{
+  "name": "vulgata-language",
+  "displayName": "Vulgata Language Support",
+  "description": "Syntax highlighting and basic editor support for Vulgata (.vg) files.",
+  "version": "0.1.0",
+  "publisher": "vulgata",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/soyrochus/vulgata.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "vulgata",
+    "vg",
+    "language",
+    "syntax",
+    "textmate"
+  ],
+  "files": [
+    "language-configuration.json",
+    "syntaxes/**",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "vulgata",
+        "aliases": [
+          "Vulgata",
+          "vulgata"
+        ],
+        "extensions": [
+          ".vg"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "vulgata",
+        "scopeName": "source.vulgata",
+        "path": "./syntaxes/vulgata.tmLanguage.json"
+      }
+    ]
+  }
+}
