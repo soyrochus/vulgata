@@ -4,318 +4,129 @@ import console
 import file
 
 const FORMAT: Text = "vaultpack"
-const VERSION: Int = 1
 
 record CliOptions:
-  source: Text
-    meaning: "Directory to pack"
-  output: Text
-    meaning: "Target archive file"
-  password: Text
-    meaning: "Encryption passphrase"
-  recursive: Bool
-    meaning: "Enable recursive traversal"
-  compress: Bool
-    meaning: "Enable compression"
+  source_path: Text
+  archive_path: Text
   force: Bool
-    meaning: "Overwrite output if exists"
-
-record FileEntry:
-  path: Text
-    meaning: "Relative path in archive"
-  size: Int
-  content: Bytes
 
 record Bundle:
-  root: Text
-  entries: List[FileEntry]
-
-record Archive:
-  header: Text
-  payload: Bytes
+  source_path: Text
+  archive_text: Text
 
 record Summary:
-  files: Int
-  raw_bytes: Int
-  compressed_bytes: Int
-  encrypted_bytes: Int
-  output: Text
+  source_path: Text
+  archive_path: Text
+  bytes_written: Int
+  mode: Text
 
-extern pure action list_dir(path: Text) -> Result[List[Text], Text]
-extern pure action is_dir(path: Text) -> Bool
-extern pure action join(a: Text, b: Text) -> Text
-extern pure action rel(root: Text, full: Text) -> Text
+enum PackMode:
+  Plain
+  Forced
 
-extern action read_bytes(path: Text) -> Result[Bytes, Text]
-extern action write_bytes(path: Text, data: Bytes) -> Result[None, Text]
+action parse_default_options() -> CliOptions:
+  return CliOptions(source_path: "README.md", archive_path: "vaultpack.out", force: true)
 
-extern action compress(data: Bytes) -> Result[Bytes, Text]
-extern action derive_key(password: Text) -> Result[Bytes, Text]
-extern action encrypt(data: Bytes, key: Bytes) -> Result[Bytes, Text]
+action classify_mode(force: Bool) -> PackMode:
+  if force:
+    return Forced
+  return Plain
 
-extern pure action bytes_length(data: Bytes) -> Int
-extern pure action bytes_concat(a: Bytes, b: Bytes) -> Bytes
-extern pure action text_encode(value: Text) -> Bytes
+action mode_name(mode: PackMode) -> Text:
+  match mode:
+    Plain():
+      return "plain"
+    Forced():
+      return "forced"
 
-# -------------------------
-# CLI parsing
-# -------------------------
-
-action parse_args(args: List[Text]) -> Result[CliOptions, Text]:
-  intent:
-    goal: "Parse CLI arguments into options"
-
-  requires list.length(args) >= 3
-
-  let options = CliOptions(
-    source: args[0],
-    output: args[1],
-    password: args[2],
-    recursive: true,
-    compress: true,
-    force: false
-  )
-
-  return Ok(options)
-
-# -------------------------
-# Validation
-# -------------------------
-
-action validate(options: CliOptions) -> Result[None, Text]:
-  intent:
-    goal: "Validate input before execution"
-
-  requires options.source != ""
-  requires options.output != ""
-
-  if not file.exists(options.source):
+action validate(options: CliOptions) -> Result[PackMode, Text]:
+  if not file.exists(options.source_path):
     return Err("source does not exist")
 
-  if not is_dir(options.source):
-    return Err("source is not a directory")
-
-  if file.exists(options.output) and not options.force:
+  if file.exists(options.archive_path) and not options.force:
     return Err("output exists")
 
-  return Ok(none)
-
-# -------------------------
-# File collection
-# -------------------------
-
-action collect(root: Text, recursive: Bool) -> Result[List[Text], Text]:
-  intent:
-    goal: "Collect all files under root"
-
-  var queue = [root]
-  var files = []
-
-  step walk:
-    while list.length(queue) > 0:
-      let current = queue[0]
-      queue := list.tail(queue)
-
-      let r = list_dir(current)
-      if r.is_err():
-        return Err(r.error())
-
-      let children = r.value()
-
-      for each child in children:
-        if is_dir(child):
-          if recursive:
-            queue := list.push(queue, child)
-        else:
-          files := list.push(files, child)
-
-  return Ok(files)
-
-# -------------------------
-# Bundle creation
-# -------------------------
-
-action load_entry(root: Text, full: Text) -> Result[FileEntry, Text]:
-  let r = read_bytes(full)
-
-  if r.is_err():
-    return Err(r.error())
-
-  return Ok(
-    FileEntry(
-      path: rel(root, full),
-      size: bytes_length(r.value()),
-      content: r.value()
-    )
-  )
+  return Ok(classify_mode(options.force))
 
 action build_bundle(options: CliOptions) -> Result[Bundle, Text]:
-  intent:
-    goal: "Create internal bundle"
-    constraints:
-      - "All files included"
-      - "No partial extraction at archive level"
+  match file.read_text(options.source_path):
+    Ok(contents):
+      return Ok(Bundle(source_path: options.source_path, archive_text: contents))
+    Err(e):
+      return Err(e)
 
-  let r = collect(options.source, options.recursive)
-  if r.is_err():
-    return Err(r.error())
-
-  let files = r.value()
-
-  var entries = []
-
-  step load:
-    for each f in files:
-      let e = load_entry(options.source, f)
-
-      if e.is_err():
-        return Err(e.error())
-
-      entries := list.push(entries, e.value())
-
-  return Ok(Bundle(root: options.source, entries: entries))
-
-# -------------------------
-# Serialization
-# -------------------------
-
-action serialize(bundle: Bundle) -> Bytes:
-  intent:
-    goal: "Convert bundle to raw bytes"
-
-  var acc = text_encode("vaultpack")
-
-  step fold:
-    for each e in bundle.entries:
-      acc := bytes_concat(acc, text_encode(e.path))
-      acc := bytes_concat(acc, e.content)
-
-  return acc
-
-# -------------------------
-# Compression
-# -------------------------
-
-action compress_payload(data: Bytes, enabled: Bool) -> Result[Bytes, Text]:
-  if not enabled:
-    return Ok(data)
-
-  let r = compress(data)
-  if r.is_err():
-    return Err(r.error())
-
-  return Ok(r.value())
-
-# -------------------------
-# Encryption
-# -------------------------
-
-action encrypt_payload(data: Bytes, password: Text) -> Result[Bytes, Text]:
-  intent:
-    goal: "Encrypt full payload"
-    properties:
-      - "All-or-nothing archive"
-
-  let k = derive_key(password)
-  if k.is_err():
-    return Err(k.error())
-
-  let r = encrypt(data, k.value())
-  if r.is_err():
-    return Err(r.error())
-
-  return Ok(r.value())
-
-# -------------------------
-# Write archive
-# -------------------------
-
-action write_archive(path: Text, payload: Bytes) -> Result[None, Text]:
-  let archive = bytes_concat(text_encode(FORMAT), payload)
-  return write_bytes(path, archive)
-
-# -------------------------
-# Orchestration
-# -------------------------
+action write_archive(bundle: Bundle, options: CliOptions, mode: PackMode) -> Result[Summary, Text]:
+  match file.write_text(options.archive_path, bundle.archive_text):
+    Ok(_):
+      return Ok(Summary(source_path: bundle.source_path, archive_path: options.archive_path, bytes_written: 1, mode: mode_name(mode)))
+    Err(e):
+      return Err(e)
 
 action run(options: CliOptions) -> Result[Summary, Text]:
-  intent:
-    goal: "Execute full pipeline"
-    constraints:
-      - "validate → bundle → compress → encrypt → write"
+  match validate(options):
+    Ok(mode):
+      match build_bundle(options):
+        Ok(bundle):
+          return write_archive(bundle, options, mode)
+        Err(e):
+          return Err(e)
+    Err(e):
+      return Err(e)
 
-  let v = validate(options)
-  if v.is_err():
-    return Err(v.error())
+action main() -> Int:
+  let options = parse_default_options()
+  match run(options):
+    Ok(summary):
+      let Summary(archive_path: out, mode: selected_mode) = summary
+      let printed = console.println(out)
+      return 0
+    Err(e):
+      let reported = console.eprintln(e)
+      return 1
 
-  step bundle:
-    let b = build_bundle(options)
-    if b.is_err():
-      return Err(b.error())
+test match_result_ok:
+  let result: Result[Int, Text] = Ok(42)
+  match result:
+    Ok(value):
+      expect value == 42
+    Err(_):
+      expect false
 
-  step serialize:
-    let raw = serialize(b.value())
+test match_result_err:
+  let result: Result[Int, Text] = Err("bad input")
+  match result:
+    Ok(_):
+      expect false
+    Err(message):
+      expect message == "bad input"
 
-  step compress:
-    let c = compress_payload(raw, options.compress)
-    if c.is_err():
-      return Err(c.error())
+test match_option_some:
+  let value = Some("hello")
+  match value:
+    Some(text):
+      expect text == "hello"
+    None:
+      expect false
 
-  step encrypt:
-    let e = encrypt_payload(c.value(), options.password)
-    if e.is_err():
-      return Err(e.error())
+test tuple_destructure:
+  let pair = (10, 20)
+  let (left, right) = pair
+  expect left == 10
+  expect right == 20
 
-  step write:
-    let w = write_archive(options.output, e.value())
-    if w.is_err():
-      return Err(w.error())
+test record_destructure:
+  let bundle = Bundle(source_path: "data.txt", archive_text: "vaultpack\ndata")
+  let Bundle(source_path: path, archive_text: text) = bundle
+  expect path == "data.txt"
+  expect text == "vaultpack\ndata"
 
-  return Ok(
-    Summary(
-      files: list.length(b.value().entries),
-      raw_bytes: bytes_length(raw),
-      compressed_bytes: bytes_length(c.value()),
-      encrypted_bytes: bytes_length(e.value()),
-      output: options.output
-    )
-  )
-
-# -------------------------
-# Entry point
-# -------------------------
-
-action main(args: List[Text]) -> Int:
-  let r = parse_args(args)
-
-  if r.is_err():
-    let _ = console.eprintln(r.error())
-    return 2
-
-  let run_result = run(r.value())
-
-  if run_result.is_err():
-    let _ = console.eprintln(run_result.error())
-    return 1
-
-  let summary = run_result.value()
-
-  let _ = console.println(
-    "vaultpack wrote " + summary.output
-  )
-
-  return 0
-
-# -------------------------
-# Tests
-# -------------------------
-
-test result_semantics:
-  let ok = Ok(1)
-  expect ok.is_ok()
-  expect ok.value() == 1
+test mode_match_and_record_destructure:
+  let summary = Summary(source_path: "src.txt", archive_path: "archive.vpk", bytes_written: 1, mode: mode_name(Forced))
+  let Summary(archive_path: output_path, mode: output_mode) = summary
+  expect output_path == "archive.vpk"
+  expect output_mode == "forced"
 
 test mutation_rules:
-  var x = 1
-  x := x + 1
-  expect x == 2
+  var count = 1
+  count := count + 1
+  expect count == 2

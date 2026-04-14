@@ -1,0 +1,321 @@
+module tools.vaultpack
+
+import console
+import file
+
+const FORMAT: Text = "vaultpack"
+const VERSION: Int = 1
+
+record CliOptions:
+  source: Text
+    meaning: "Directory to pack"
+  output: Text
+    meaning: "Target archive file"
+  password: Text
+    meaning: "Encryption passphrase"
+  recursive: Bool
+    meaning: "Enable recursive traversal"
+  compress: Bool
+    meaning: "Enable compression"
+  force: Bool
+    meaning: "Overwrite output if exists"
+
+record FileEntry:
+  path: Text
+    meaning: "Relative path in archive"
+  size: Int
+  content: Bytes
+
+record Bundle:
+  root: Text
+  entries: List[FileEntry]
+
+record Archive:
+  header: Text
+  payload: Bytes
+
+record Summary:
+  files: Int
+  raw_bytes: Int
+  compressed_bytes: Int
+  encrypted_bytes: Int
+  output: Text
+
+extern pure action list_dir(path: Text) -> Result[List[Text], Text]
+extern pure action is_dir(path: Text) -> Bool
+extern pure action join(a: Text, b: Text) -> Text
+extern pure action rel(root: Text, full: Text) -> Text
+
+extern action read_bytes(path: Text) -> Result[Bytes, Text]
+extern action write_bytes(path: Text, data: Bytes) -> Result[None, Text]
+
+extern action compress(data: Bytes) -> Result[Bytes, Text]
+extern action derive_key(password: Text) -> Result[Bytes, Text]
+extern action encrypt(data: Bytes, key: Bytes) -> Result[Bytes, Text]
+
+extern pure action bytes_length(data: Bytes) -> Int
+extern pure action bytes_concat(a: Bytes, b: Bytes) -> Bytes
+extern pure action text_encode(value: Text) -> Bytes
+
+# -------------------------
+# CLI parsing
+# -------------------------
+
+action parse_args(args: List[Text]) -> Result[CliOptions, Text]:
+  intent:
+    goal: "Parse CLI arguments into options"
+
+  requires list.length(args) >= 3
+
+  let options = CliOptions(
+    source: args[0],
+    output: args[1],
+    password: args[2],
+    recursive: true,
+    compress: true,
+    force: false
+  )
+
+  return Ok(options)
+
+# -------------------------
+# Validation
+# -------------------------
+
+action validate(options: CliOptions) -> Result[None, Text]:
+  intent:
+    goal: "Validate input before execution"
+
+  requires options.source != ""
+  requires options.output != ""
+
+  if not file.exists(options.source):
+    return Err("source does not exist")
+
+  if not is_dir(options.source):
+    return Err("source is not a directory")
+
+  if file.exists(options.output) and not options.force:
+    return Err("output exists")
+
+  return Ok(none)
+
+# -------------------------
+# File collection
+# -------------------------
+
+action collect(root: Text, recursive: Bool) -> Result[List[Text], Text]:
+  intent:
+    goal: "Collect all files under root"
+
+  var queue = [root]
+  var files = []
+
+  step walk:
+    while list.length(queue) > 0:
+      let current = queue[0]
+      queue := list.tail(queue)
+
+      let r = list_dir(current)
+      if r.is_err():
+        return Err(r.error())
+
+      let children = r.value()
+
+      for each child in children:
+        if is_dir(child):
+          if recursive:
+            queue := list.push(queue, child)
+        else:
+          files := list.push(files, child)
+
+  return Ok(files)
+
+# -------------------------
+# Bundle creation
+# -------------------------
+
+action load_entry(root: Text, full: Text) -> Result[FileEntry, Text]:
+  let r = read_bytes(full)
+
+  if r.is_err():
+    return Err(r.error())
+
+  return Ok(
+    FileEntry(
+      path: rel(root, full),
+      size: bytes_length(r.value()),
+      content: r.value()
+    )
+  )
+
+action build_bundle(options: CliOptions) -> Result[Bundle, Text]:
+  intent:
+    goal: "Create internal bundle"
+    constraints:
+      - "All files included"
+      - "No partial extraction at archive level"
+
+  let r = collect(options.source, options.recursive)
+  if r.is_err():
+    return Err(r.error())
+
+  let files = r.value()
+
+  var entries = []
+
+  step load:
+    for each f in files:
+      let e = load_entry(options.source, f)
+
+      if e.is_err():
+        return Err(e.error())
+
+      entries := list.push(entries, e.value())
+
+  return Ok(Bundle(root: options.source, entries: entries))
+
+# -------------------------
+# Serialization
+# -------------------------
+
+action serialize(bundle: Bundle) -> Bytes:
+  intent:
+    goal: "Convert bundle to raw bytes"
+
+  var acc = text_encode("vaultpack")
+
+  step fold:
+    for each e in bundle.entries:
+      acc := bytes_concat(acc, text_encode(e.path))
+      acc := bytes_concat(acc, e.content)
+
+  return acc
+
+# -------------------------
+# Compression
+# -------------------------
+
+action compress_payload(data: Bytes, enabled: Bool) -> Result[Bytes, Text]:
+  if not enabled:
+    return Ok(data)
+
+  let r = compress(data)
+  if r.is_err():
+    return Err(r.error())
+
+  return Ok(r.value())
+
+# -------------------------
+# Encryption
+# -------------------------
+
+action encrypt_payload(data: Bytes, password: Text) -> Result[Bytes, Text]:
+  intent:
+    goal: "Encrypt full payload"
+    properties:
+      - "All-or-nothing archive"
+
+  let k = derive_key(password)
+  if k.is_err():
+    return Err(k.error())
+
+  let r = encrypt(data, k.value())
+  if r.is_err():
+    return Err(r.error())
+
+  return Ok(r.value())
+
+# -------------------------
+# Write archive
+# -------------------------
+
+action write_archive(path: Text, payload: Bytes) -> Result[None, Text]:
+  let archive = bytes_concat(text_encode(FORMAT), payload)
+  return write_bytes(path, archive)
+
+# -------------------------
+# Orchestration
+# -------------------------
+
+action run(options: CliOptions) -> Result[Summary, Text]:
+  intent:
+    goal: "Execute full pipeline"
+    constraints:
+      - "validate → bundle → compress → encrypt → write"
+
+  let v = validate(options)
+  if v.is_err():
+    return Err(v.error())
+
+  step bundle:
+    let b = build_bundle(options)
+    if b.is_err():
+      return Err(b.error())
+
+  step serialize:
+    let raw = serialize(b.value())
+
+  step compress:
+    let c = compress_payload(raw, options.compress)
+    if c.is_err():
+      return Err(c.error())
+
+  step encrypt:
+    let e = encrypt_payload(c.value(), options.password)
+    if e.is_err():
+      return Err(e.error())
+
+  step write:
+    let w = write_archive(options.output, e.value())
+    if w.is_err():
+      return Err(w.error())
+
+  return Ok(
+    Summary(
+      files: list.length(b.value().entries),
+      raw_bytes: bytes_length(raw),
+      compressed_bytes: bytes_length(c.value()),
+      encrypted_bytes: bytes_length(e.value()),
+      output: options.output
+    )
+  )
+
+# -------------------------
+# Entry point
+# -------------------------
+
+action main(args: List[Text]) -> Int:
+  let r = parse_args(args)
+
+  if r.is_err():
+    let _ = console.eprintln(r.error())
+    return 2
+
+  let run_result = run(r.value())
+
+  if run_result.is_err():
+    let _ = console.eprintln(run_result.error())
+    return 1
+
+  let summary = run_result.value()
+
+  let _ = console.println(
+    "vaultpack wrote " + summary.output
+  )
+
+  return 0
+
+# -------------------------
+# Tests
+# -------------------------
+
+test result_semantics:
+  let ok = Ok(1)
+  expect ok.is_ok()
+  expect ok.value() == 1
+
+test mutation_rules:
+  var x = 1
+  x := x + 1
+  expect x == 2
